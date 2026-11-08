@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="zh-HK">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no">
+  <meta name="theme-color" content="#0d9488" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#18181b" media="(prefers-color-scheme: dark)">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="分享本本">
+  <meta name="description" content="安全密碼與資料管理 · AES-GCM 加密 · 本機離線 PWA">
+  <link rel="manifest" href="manifest.json">
+  <link rel="icon" type="image/png" href="icons/apple-touch-icon.png">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <title>分享本本 - 安全密碼管家</title>
+
+  <!-- Local assets only (offline-ready) -->
+  <link rel="stylesheet" href="./tailwind-built.css">
+  <link rel="stylesheet" href="./fa/all.min.css">
+  <script defer src="./alpine.min.js"></script>
+  <script src="./app.js"></script>
+
+  <style>
+    /* Minimal extras not in utility sheet */
+    ::-webkit-scrollbar { width: 5px; height: 5px }
+    ::-webkit-scrollbar-track { background: transparent }
+    ::-webkit-scrollbar-thumb { background: #d4d4d8; border-radius: 9999px }
+    .dark ::-webkit-scrollbar-thumb { background: #3f3f46 }
+    html, body { height: 100%; }
+    body { -webkit-overflow-scrolling: touch; overscroll-behavior: none; }
+    [x-cloak] { display: none !important; }
+    input, textarea { font-size: 16px !important; } /* prevent iOS zoom */
+  </style>
+</head>
+<body class="bg-zinc-50 dark:bg-zinc-950 text-zinc-900 dark:text-zinc-100 font-sans antialiased min-h-screen flex flex-col items-center justify-start transition-colors duration-300 overflow-x-hidden"
+      x-data="passwordManager()" x-init="init()" x-cloak>
+
+  <!-- ═══════════════ LOCK / SETUP SCREEN ═══════════════ -->
+  <div x-show="isLocked" class="fixed inset-0 z-[100] lock-bg bg-zinc-50 dark:bg-zinc-950 flex items-center justify-center p-4 safe-top safe-bottom" x-cloak>
+    <div class="w-full max-w-sm bg-white dark:bg-zinc-900 rounded-3xl shadow-2xl border border-zinc-200 dark:border-zinc-800 p-6 animate-fade-in">
+      <div class="flex flex-col items-center text-center mb-5">
+        <div class="w-14 h-14 rounded-2xl bg-brand-600 shadow-lg shadow-brand-500/30 flex items-center justify-center text-white text-2xl mb-4">
+          <i class="fa-solid" :class="isFirstSetup ? 'fa-shield-halved' : 'fa-lock'"></i>
+        </div>
+        <h2 class="text-base font-bold text-zinc-900 dark:text-white" x-text="isFirstSetup ? '設定主密碼' : '解鎖分享本本'"></h2>
+        <p class="text-[11px] text-zinc-500 dark:text-zinc-400 mt-1.5 leading-relaxed">
+          <span x-show="isFirstSetup">資料以 AES-GCM 加密儲存於本機。<br>主密碼無法復原，請妥善保管。</span>
+          <span x-show="!isFirstSetup">輸入主密碼以解密本機資料</span>
+        </p>
+      </div>
+
+      <form @submit.prevent="isFirstSetup ? setupMasterPassword() : unlock()" class="space-y-3">
+        <div>
+          <label class="text-[11px] font-medium text-zinc-500 mb-1 block">主密碼</label>
+          <div class="relative">
+            <input
+              :type="showMasterPassword ? 'text' : 'password'"
+              x-model="masterPasswordInput"
+              :placeholder="isFirstSetup ? '至少 8 個字元' : '輸入主密碼'"
+              autocomplete="current-password"
+              class="w-full px-3.5 py-2.5 pr-10 bg-zinc-100 dark:bg-zinc-800 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-brand-500"
+              :disabled="isProcessing"
+            >
+            <button type="button" @click="showMasterPassword = !showMasterPassword"
+                    class="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-400 hover:text-zinc-600">
+              <i class="fa-solid text-sm" :class="showMasterPassword ? 'fa-eye-slash' : 'fa-eye'"></i>
+            </button>
+          </div>
+        </div>
+
+        <div x-show="isFirstSetup">
+          <label class="text-[11px] font-medium text-zinc-500 mb-1 block">確認主密碼</label>
+          <input
+            :type="showMasterPassword ? 'text' : 'password'"
+            x-model="confirmPasswordInput"
+            placeholder="再次輸入"
+            autocomplete="new-password"
+            class="w-full px-3.5 py-2.5 bg-zinc-100 dark:bg-zinc-800 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-brand-500"
+            :disabled="isProcessing"
+          >
+        </div>
+
+        <p x-show="unlockError" class="text-xs text-rose-600 dark:text-rose-400 font-medium" x-text="unlockError"></p>
+
+        <button type="submit"
+                class="w-full py-3 rounded-2xl bg-brand-600 hover:bg-brand-700 text-white text-sm font-semibold transition shadow-lg shadow-brand-500/25 disabled:opacity-50"
+                :disabled="isProcessing">
+          <span x-show="isProcessing"><i class="fa-solid fa-spinner fa-spin mr-1.5"></i>處理中…</span>
+          <span x-show="!isProcessing" x-text="isFirstSetup ? '建立加密保險庫' : '解鎖'"></span>
+        </button>
+      </form>
+
+      <p class="text-center text-[10px] text-zinc-400 mt-5 leading-relaxed">
+        PBKDF2 · 120,000 次迭代 · AES-256-GCM<br>
+        金鑰僅存在記憶體，關閉分頁即清除
+      </p>
+    </div>
+  </div>
+
+  <!-- ═══════════════ MAIN APP ═══════════════ -->
+  <div x-show="isUnlocked" class="w-full max-w-md sm:max-w-lg md:max-w-xl lg:max-w-2xl min-h-screen sm:min-h-[90vh] sm:my-6 sm:rounded-3xl sm:shadow-2xl bg-white dark:bg-zinc-900 border border-zinc-200/80 dark:border-zinc-800 flex flex-col overflow-hidden relative transition-all" x-cloak>
+
+    <!-- Header -->
+    <header class="glass z-40 px-4 pb-3 border-b border-zinc-100 dark:border-zinc-800/80 safe-top relative">
+      <div class="flex items-center justify-between mb-3">
+        <div class="flex items-center space-x-2.5 min-w-0">
+          <div class="w-9 h-9 rounded-2xl bg-brand-600 shadow-lg shadow-brand-500/25 flex items-center justify-center text-white flex-shrink-0">
+            <i class="fa-solid fa-book-open text-sm"></i>
+          </div>
+          <div class="min-w-0">
+            <h1 class="text-base font-bold tracking-tight text-zinc-900 dark:text-white">分享本本</h1>
+            <p class="text-[10px] text-zinc-500 dark:text-zinc-400 flex items-center gap-1.5">
+              加密 · 離線 PWA
+              <span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[9px] font-semibold border"
+                    :class="isOnline
+                      ? 'bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-900/30 dark:text-emerald-300 dark:border-emerald-800'
+                      : 'bg-amber-50 text-amber-700 border-amber-200 dark:bg-amber-900/30 dark:text-amber-300 dark:border-amber-800'">
+                <span class="w-1.5 h-1.5 rounded-full" :class="isOnline ? 'bg-emerald-500' : 'bg-amber-500'"></span>
+                <span x-text="isOnline ? '在線' : '離線'"></span>
+              </span>
+            </p>
+          </div>
+        </div>
+        <div class="flex items-center space-x-1">
+          <button type="button" @click="toggleTheme()" class="w-8 h-8 rounded-full bg-zinc-100 dark:bg-zinc-800 hover:bg-zinc-200 dark:hover:bg-zinc-700 flex items-center justify-center text-zinc-600 dark:text-zinc-300 transition" title="外觀">
+            <i class="fa-solid text-xs" :class="darkMode ? 'fa-sun' : 'fa-moon'"></i>
+          </button>
+          <button type="button" @click="lock()" class="w-8 h-8 rounded-full bg-zinc-100 dark:bg-zinc-800 hover:bg-zinc-200 dark:hover:bg-zinc-700 flex items-center justify-center text-zinc-600 dark:text-zinc-300 transition" title="鎖定">
+            <i class="fa-solid fa-lock text-xs"></i>
+          </button>
+          <button type="button" @click="openModal()" class="w-8 h-8 rounded-full bg-brand-600 hover:bg-brand-700 flex items-center justify-center text-white transition shadow-md shadow-brand-500/30" title="新增">
+            <i class="fa-solid fa-plus text-xs"></i>
+          </button>
+        </div>
+      </div>
+
+      <!-- Search -->
+      <div class="relative mb-3">
+        <i class="fa-solid fa-magnifying-glass absolute left-3 top-2.5 text-zinc-400 text-sm"></i>
+        <input type="search" x-model="searchQuery" placeholder="搜尋網站、帳號或備忘錄…"
+               class="w-full pl-9 pr-9 py-2 bg-zinc-100 dark:bg-zinc-800/80 border border-transparent focus:border-brand-500 rounded-xl text-sm focus:outline-none transition">
+        <button x-show="searchQuery" @click="searchQuery = ''" class="absolute right-3 top-2.5 text-zinc-400 hover:text-zinc-600">
+          <i class="fa-solid fa-xmark text-sm"></i>
+        </button>
+      </div>
+
+      <!-- Action Pills -->
+      <div class="flex space-x-1.5 overflow-x-auto pb-1 no-scrollbar">
+        <button type="button" @click="exportToJson()"
+                class="flex items-center space-x-1 px-3 py-1.5 rounded-full text-[11px] font-semibold whitespace-nowrap transition-all bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 hover:bg-brand-50 hover:text-brand-700 dark:hover:bg-brand-900/40 dark:hover:text-brand-300">
+          <i class="fa-solid fa-file-code text-[10px]"></i><span>匯出 JSON</span>
+        </button>
+        <label class="flex items-center space-x-1 px-3 py-1.5 rounded-full text-[11px] font-semibold whitespace-nowrap transition-all bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 hover:bg-brand-50 hover:text-brand-700 dark:hover:bg-brand-900/40 dark:hover:text-brand-300 cursor-pointer">
+          <i class="fa-solid fa-upload text-[10px]"></i><span>匯入 JSON</span>
+          <input type="file" accept=".json,application/json" class="hidden" @change="importFromJson($event)">
+        </label>
+        <button type="button" @click="exportToHtml()"
+                class="flex items-center space-x-1 px-3 py-1.5 rounded-full text-[11px] font-semibold whitespace-nowrap transition-all bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 hover:bg-brand-50 hover:text-brand-700 dark:hover:bg-brand-900/40 dark:hover:text-brand-300">
+          <i class="fa-solid fa-download text-[10px]"></i><span>匯出 HTML</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- Status bar -->
+    <div class="px-4 py-2 flex items-center justify-between border-b border-zinc-100 dark:border-zinc-800/60 bg-zinc-50/50 dark:bg-zinc-900/50">
+      <span class="text-[11px] text-zinc-500 dark:text-zinc-400">
+        <span x-text="filteredPasswords.length"></span> 筆
+        <span x-show="searchQuery" class="text-brand-600 dark:text-brand-400">（搜尋中）</span>
+        · 共 <span x-text="passwords.length"></span> 筆
+      </span>
+      <span class="text-[10px] text-zinc-400 flex items-center gap-1">
+        <i class="fa-solid fa-shield-halved text-brand-500"></i> 已加密
+      </span>
+    </div>
+
+    <!-- List -->
+    <main class="flex-1 overflow-y-auto p-3 space-y-2.5" style="-webkit-overflow-scrolling:touch; overscroll-behavior-y:contain;">
+
+      <!-- Empty -->
+      <div x-show="filteredPasswords.length === 0" class="flex flex-col items-center justify-center py-16 px-4 text-center">
+        <div class="w-16 h-16 rounded-3xl bg-zinc-100 dark:bg-zinc-800 flex items-center justify-center text-zinc-400 mb-3 text-2xl">
+          <i class="fa-solid fa-inbox"></i>
+        </div>
+        <h3 class="font-bold text-sm text-zinc-700 dark:text-zinc-300" x-text="searchQuery ? '找不到符合項目' : '尚無資料'"></h3>
+        <p class="text-xs text-zinc-400 mt-1" x-text="searchQuery ? '試試其他關鍵字' : '點右上角 + 新增，或匯入 JSON'"></p>
+      </div>
+
+      <!-- Items -->
+      <template x-for="(item, index) in filteredPasswords" :key="String(item.id) + '-' + index">
+        <div class="group bg-white dark:bg-zinc-800/70 border border-zinc-200/60 dark:border-zinc-800 hover:border-brand-500/40 p-3.5 rounded-2xl shadow-sm hover:shadow-md transition-all cursor-default">
+          <!-- Title row -->
+          <div class="flex items-center justify-between mb-2">
+            <div class="flex items-center space-x-2.5 min-w-0 flex-1">
+              <div class="w-8 h-8 rounded-xl bg-brand-600/90 flex items-center justify-center text-xs font-bold text-white flex-shrink-0"
+                   x-text="String(item.siteName || '?').charAt(0).toUpperCase()"></div>
+              <div class="min-w-0">
+                <h4 class="text-xs font-extrabold text-zinc-950 dark:text-white truncate flex items-center gap-1.5">
+                  <span x-text="item.siteName"></span>
+                  <a x-show="item.url" :href="safeUrl(item.url)" target="_blank" rel="noopener noreferrer"
+                     class="text-zinc-400 hover:text-brand-600" @click.stop title="開啟網站">
+                    <i class="fa-solid fa-arrow-up-right-from-square text-[9px]"></i>
+                  </a>
+                </h4>
+              </div>
+            </div>
+            <div class="flex items-center space-x-0.5 flex-shrink-0 opacity-70 group-hover:opacity-100 transition-opacity">
+              <button type="button" @click="editItem(item)" class="w-7 h-7 rounded-full hover:bg-zinc-100 dark:hover:bg-zinc-700 flex items-center justify-center text-zinc-500 hover:text-brand-600 transition" title="編輯">
+                <i class="fa-solid fa-pen text-[10px]"></i>
+              </button>
+              <button type="button" @click="deleteItem(item.id)" class="w-7 h-7 rounded-full hover:bg-rose-50 dark:hover:bg-rose-900/30 flex items-center justify-center text-zinc-500 hover:text-rose-600 transition" title="刪除">
+                <i class="fa-solid fa-trash-can text-[10px]"></i>
+              </button>
+            </div>
+          </div>
+
+          <!-- Account -->
+          <div class="flex items-center gap-2 pl-[42px] mb-1">
+            <span class="text-[10px] text-zinc-400 w-7 flex-shrink-0">帳號</span>
+            <span class="text-[11px] font-mono text-zinc-700 dark:text-zinc-300 truncate flex-1 select-all" x-text="item.username"></span>
+            <button type="button" @click="copyToClipboard(item.username, '帳號已複製')" class="text-zinc-400 hover:text-brand-600 p-0.5" title="複製">
+              <i class="fa-regular fa-copy text-[10px]"></i>
+            </button>
+          </div>
+          <!-- Password -->
+          <div class="flex items-center gap-2 pl-[42px] mb-1">
+            <span class="text-[10px] text-zinc-400 w-7 flex-shrink-0">密碼</span>
+            <span class="pwd-chip px-1.5 py-0.5 rounded-md bg-brand-50 dark:bg-brand-900/30 text-brand-800 dark:text-brand-200 select-all" x-text="item.password"></span>
+            <button type="button" @click="copyToClipboard(item.password, '密碼已複製')" class="text-zinc-400 hover:text-brand-600 p-0.5" title="複製">
+              <i class="fa-regular fa-copy text-[10px]"></i>
+            </button>
+          </div>
+          <!-- Notes -->
+          <div x-show="item.notes" class="flex items-start gap-2 pl-[42px] pt-0.5">
+            <i class="fa-solid fa-note-sticky text-[10px] text-zinc-400 mt-0.5 flex-shrink-0"></i>
+            <button type="button" class="note-line flex-1 min-w-0 text-zinc-500 dark:text-zinc-400"
+                    :class="{ 'expanded': item._noteOpen }"
+                    @click="item._noteOpen = !item._noteOpen"
+                    x-text="item.notes"></button>
+          </div>
+        </div>
+      </template>
+    </main>
+
+    <!-- Footer -->
+    <footer class="glass px-4 py-2.5 border-t border-zinc-100 dark:border-zinc-800/80 flex items-center justify-between text-[11px] text-zinc-500 dark:text-zinc-400 safe-bottom">
+      <div class="flex items-center gap-1.5">
+        <span class="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
+        <span>本機加密 · 就緒</span>
+      </div>
+      <button type="button" @click="lock()" class="hover:text-brand-600 dark:hover:text-brand-400 transition font-medium flex items-center gap-1">
+        <i class="fa-solid fa-lock text-[10px]"></i> 鎖定
+      </button>
+    </footer>
+  </div>
+
+  <!-- ═══════════════ ITEM MODAL (bottom sheet style) ═══════════════ -->
+  <div id="itemModal"
+       class="fixed inset-0 z-50 bg-black/50 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4 transition-all duration-300"
+       :class="isModalOpen ? 'opacity-100 pointer-events-auto' : 'opacity-0 pointer-events-none'"
+       x-show="true"
+       x-cloak
+       style="display: flex;">
+    <div class="absolute inset-0" @click="closeModal()"></div>
+    <div id="modalSheet"
+         class="relative bg-white dark:bg-zinc-900 w-full max-w-lg rounded-t-3xl sm:rounded-3xl max-h-[88vh] flex flex-col shadow-2xl transform transition-transform duration-300 overflow-hidden border border-zinc-200 dark:border-zinc-800"
+         :class="isModalOpen ? 'translate-y-0' : 'translate-y-full sm:translate-y-4 sm:scale-95'"
+         @click.stop>
+      <!-- Modal header -->
+      <div class="px-5 py-3.5 border-b border-zinc-100 dark:border-zinc-800 flex items-center justify-between bg-zinc-50/60 dark:bg-zinc-800/40">
+        <div class="flex items-center space-x-3">
+          <div class="w-10 h-10 rounded-full bg-brand-600 flex items-center justify-center text-white shadow-md">
+            <i class="fa-solid text-sm" :class="editingId ? 'fa-pen' : 'fa-plus'"></i>
+          </div>
+          <div>
+            <h3 class="font-bold text-sm text-zinc-900 dark:text-white" x-text="editingId ? '編輯項目' : '新增密碼項目'"></h3>
+            <p class="text-[11px] text-zinc-500 dark:text-zinc-400">資料將加密儲存於本機</p>
+          </div>
+        </div>
+        <button type="button" @click="closeModal()" class="w-8 h-8 rounded-full bg-zinc-200/70 dark:bg-zinc-700/70 hover:bg-zinc-300 dark:hover:bg-zinc-600 flex items-center justify-center text-zinc-600 dark:text-zinc-300 transition">
+          <i class="fa-solid fa-xmark text-sm"></i>
+        </button>
+      </div>
+
+      <!-- Form -->
+      <form @submit.prevent="saveItem" class="flex flex-col flex-1 overflow-hidden">
+        <div class="p-5 overflow-y-auto space-y-3.5 flex-1">
+          <div>
+            <label class="text-[11px] font-medium text-zinc-500 dark:text-zinc-400 mb-1 block">網站 / 服務名稱 <span class="text-rose-500">*</span></label>
+            <input type="text" x-model="formData.siteName" required
+                   class="w-full px-3.5 py-2.5 bg-zinc-100 dark:bg-zinc-800 border border-transparent focus:border-brand-500 rounded-xl text-sm focus:outline-none transition">
+          </div>
+          <div>
+            <label class="text-[11px] font-medium text-zinc-500 dark:text-zinc-400 mb-1 block">網址（選填）</label>
+            <input type="text" x-model="formData.url" placeholder="example.com"
+                   class="w-full px-3.5 py-2.5 bg-zinc-100 dark:bg-zinc-800 border border-transparent focus:border-brand-500 rounded-xl text-sm focus:outline-none transition">
+          </div>
+          <div>
+            <label class="text-[11px] font-medium text-zinc-500 dark:text-zinc-400 mb-1 block">帳號 / 使用者名稱 <span class="text-rose-500">*</span></label>
+            <input type="text" x-model="formData.username" required
+                   class="w-full px-3.5 py-2.5 bg-zinc-100 dark:bg-zinc-800 border border-transparent focus:border-brand-500 rounded-xl text-sm focus:outline-none transition">
+          </div>
+          <div>
+            <label class="text-[11px] font-medium text-zinc-500 dark:text-zinc-400 mb-1 block">密碼 <span class="text-rose-500">*</span></label>
+            <div class="relative">
+              <input :type="showPasswordInModal ? 'text' : 'password'" x-model="formData.password" required
+                     class="w-full px-3.5 py-2.5 pr-10 bg-zinc-100 dark:bg-zinc-800 border border-transparent focus:border-brand-500 rounded-xl text-sm font-mono focus:outline-none transition">
+              <button type="button" @click="showPasswordInModal = !showPasswordInModal"
+                      class="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-400 hover:text-zinc-600">
+                <i class="fa-solid text-sm" :class="showPasswordInModal ? 'fa-eye-slash' : 'fa-eye'"></i>
+              </button>
+            </div>
+            <button type="button" @click="generatePassword"
+                    class="mt-2 text-[11px] font-semibold text-brand-600 dark:text-brand-400 hover:text-brand-700 flex items-center gap-1">
+              <i class="fa-solid fa-wand-magic-sparkles text-[10px]"></i> 產生安全隨機密碼
+            </button>
+          </div>
+          <div>
+            <label class="text-[11px] font-medium text-zinc-500 dark:text-zinc-400 mb-1 block">備忘錄（選填）</label>
+            <textarea x-model="formData.notes" rows="2" placeholder="簡短備註即可"
+                      class="w-full px-3.5 py-2.5 bg-zinc-100 dark:bg-zinc-800 border border-transparent focus:border-brand-500 rounded-xl text-sm focus:outline-none transition resize-none"></textarea>
+          </div>
+        </div>
+
+        <!-- Modal footer -->
+        <div class="px-5 py-3 border-t border-zinc-100 dark:border-zinc-800 bg-zinc-50/60 dark:bg-zinc-800/40 flex items-center justify-end gap-2 safe-bottom">
+          <button type="button" @click="closeModal()"
+                  class="px-3.5 py-2 rounded-xl text-xs font-semibold bg-zinc-200 dark:bg-zinc-700 hover:bg-zinc-300 dark:hover:bg-zinc-600 text-zinc-800 dark:text-zinc-200 transition">
+            取消
+          </button>
+          <button type="submit"
+                  class="px-4 py-2 rounded-xl text-xs font-semibold bg-brand-600 hover:bg-brand-700 text-white transition shadow-md shadow-brand-500/25">
+            儲存
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Toast -->
+  <div class="fixed bottom-8 left-1/2 -translate-x-1/2 z-[60] pointer-events-none safe-bottom"
+       x-show="toasts.length > 0">
+    <template x-for="toast in toasts" :key="toast.id">
+      <div class="bg-zinc-900 text-white dark:bg-white dark:text-zinc-900 px-4 py-2.5 rounded-2xl shadow-2xl text-xs font-medium flex items-center gap-2.5 mb-2 animate-fade-in pointer-events-auto">
+        <i class="fa-solid"
+           :class="toast.type === 'success' ? 'fa-circle-check text-emerald-400' : (toast.type === 'error' ? 'fa-triangle-exclamation text-amber-400' : 'fa-circle-info text-sky-400')"></i>
+        <span x-text="toast.message"></span>
+      </div>
+    </template>
+  </div>
+
+  <script>
+    /* x-cloak 兜底：無論 Alpine / app.js 是否成功，超時後一定解除，避免白屏 */
+    setTimeout(function () {
+      var b = document.body;
+      if (!b || !b.hasAttribute('x-cloak')) return;
+      b.removeAttribute('x-cloak');
+      if (!window.Alpine || typeof passwordManager !== 'function') {
+        console.warn('[分享本本] 腳本載入不完整');
+        if (!document.getElementById('boot-fail')) {
+          var el = document.createElement('div');
+          el.id = 'boot-fail';
+          el.setAttribute('style', 'position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;padding:1.5rem;background:#fafafa;font-family:system-ui;text-align:center');
+          el.innerHTML = '<div><h1 style="font-size:1.1rem;margin:0 0 .5rem">載入失敗</h1><p style="font-size:.85rem;color:#71717a;margin:0 0 1rem">請檢查網路後重新整理</p><button onclick="location.reload()" style="padding:.6rem 1.2rem;border-radius:999px;border:0;background:#0d9488;color:#fff;font-weight:600;font-size:.85rem">重新整理</button></div>';
+          document.body.appendChild(el);
+        }
+      }
+    }, 3000);
+
+    /* Service Worker：updateViaCache none，避免 sw.js 被 HTTP 快取卡住 */
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', function () {
+        navigator.serviceWorker.register('./sw.js', { updateViaCache: 'none' })
+          .then(function (reg) {
+            // 有等待中的新 SW 時可提示用戶（可選）
+            if (reg.waiting) {
+              reg.waiting.postMessage('SKIP_WAITING');
+            }
+            reg.addEventListener('updatefound', function () {
+              var nw = reg.installing;
+              if (!nw) return;
+              nw.addEventListener('statechange', function () {
+                if (nw.state === 'installed' && navigator.serviceWorker.controller) {
+                  // 新版本已就緒；若要強制切換可 postMessage SKIP_WAITING
+                  console.info('[分享本本] 有新版本可用');
+                }
+              });
+            });
+          })
+          .catch(function (err) {
+            console.warn('[分享本本] SW 註冊失敗', err);
+          });
+      });
+    }
+  </script>
+</body>
+</html>
