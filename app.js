@@ -30,6 +30,9 @@ function passwordManager() {
     isProcessing: false,
     showMasterPassword: false,
     darkMode: false,
+    // Import dialog
+    importDialogOpen: false,
+    importPreview: [],
     _cryptoKey: null,
     _salt: null,
 
@@ -276,6 +279,7 @@ function passwordManager() {
       this.isLocked = true;
       this.searchQuery = '';
       this.closeModal();
+      this.cancelImport();
       this.masterPasswordInput = '';
       this.unlockError = '';
       // Signal other tabs
@@ -416,7 +420,7 @@ function passwordManager() {
         const data = JSON.parse(text);
         if (!Array.isArray(data)) throw new Error('格式錯誤');
         const mapped = data.map((p, i) => ({
-          id: p.id ?? (Date.now() + i),
+          id: p.id ?? (Date.now() + i + Math.random()),
           siteName: p.siteName || p.site || '',
           url: p.url || '',
           username: p.username || p.user || '',
@@ -424,13 +428,46 @@ function passwordManager() {
           notes: p.notes || '',
           _noteOpen: false,
         })).filter(p => p.siteName && p.username);
-        this.passwords = [...mapped, ...this.passwords];
-        await this._saveVault();
-        this.showToast(`已匯入 ${mapped.length} 筆`, 'success');
+        if (mapped.length === 0) {
+          this.showToast('檔案內沒有可匯入的項目', 'error');
+          event.target.value = '';
+          return;
+        }
+        // 開啟選擇：合併 / 取代
+        this.importPreview = mapped;
+        this.importDialogOpen = true;
       } catch (e) {
         this.showToast('匯入失敗：檔案格式不正確', 'error');
       }
       event.target.value = '';
+    },
+    cancelImport() {
+      this.importDialogOpen = false;
+      this.importPreview = [];
+    },
+    async confirmImport(mode) {
+      // mode: 'merge' | 'replace'
+      const mapped = this.importPreview;
+      if (!mapped?.length) {
+        this.cancelImport();
+        return;
+      }
+      try {
+        if (mode === 'replace') {
+          this.passwords = mapped;
+          await this._saveVault();
+          this.showToast(`已取代，共 ${mapped.length} 筆`, 'success');
+        } else {
+          // 合併：新資料放前面，保留既有
+          this.passwords = [...mapped, ...this.passwords];
+          await this._saveVault();
+          this.showToast(`已合併匯入 ${mapped.length} 筆`, 'success');
+        }
+      } catch (e) {
+        console.error(e);
+        this.showToast('匯入失敗：本機儲存空間不足', 'error');
+      }
+      this.cancelImport();
     },
     exportToHtml() {
       if (!this.isUnlocked) return;
