@@ -336,6 +336,54 @@
     </div>
   </div>
 
+  <!-- ═══════════════ IMPORT MODE DIALOG ═══════════════ -->
+  <div x-show="importDialogOpen"
+       x-cloak
+       class="fixed inset-0 z-[70] bg-black/50 backdrop-blur-sm flex items-center justify-center p-4"
+       @keydown.escape.window="cancelImport()">
+    <div class="absolute inset-0" @click="cancelImport()"></div>
+    <div class="relative w-full max-w-sm bg-white dark:bg-zinc-900 rounded-3xl shadow-2xl border border-zinc-200 dark:border-zinc-800 p-5 animate-fade-in"
+         @click.stop>
+      <div class="flex items-center gap-3 mb-3">
+        <div class="w-10 h-10 rounded-2xl bg-brand-600/15 dark:bg-brand-500/20 flex items-center justify-center text-brand-600 dark:text-brand-400">
+          <i class="fa-solid fa-file-import text-sm"></i>
+        </div>
+        <div>
+          <h3 class="font-bold text-sm text-zinc-900 dark:text-white">匯入 JSON</h3>
+          <p class="text-[11px] text-zinc-500 dark:text-zinc-400">
+            將匯入 <span class="font-semibold text-brand-600 dark:text-brand-400" x-text="importPreview.length"></span> 筆
+            · 目前有 <span x-text="passwords.length"></span> 筆
+          </p>
+        </div>
+      </div>
+      <p class="text-[12px] text-zinc-600 dark:text-zinc-300 leading-relaxed mb-4">
+        請選擇匯入方式：
+      </p>
+      <div class="space-y-2">
+        <button type="button" @click="confirmImport('merge')"
+                class="w-full flex items-start gap-3 px-3.5 py-3 rounded-2xl bg-zinc-100 dark:bg-zinc-800 hover:bg-brand-50 dark:hover:bg-brand-900/30 border border-transparent hover:border-brand-500/40 transition text-left">
+          <i class="fa-solid fa-code-merge text-brand-600 dark:text-brand-400 mt-0.5"></i>
+          <div>
+            <div class="text-sm font-semibold text-zinc-900 dark:text-white">合併</div>
+            <div class="text-[11px] text-zinc-500 dark:text-zinc-400">保留現有資料，將新項目加到前面</div>
+          </div>
+        </button>
+        <button type="button" @click="confirmImport('replace')"
+                class="w-full flex items-start gap-3 px-3.5 py-3 rounded-2xl bg-zinc-100 dark:bg-zinc-800 hover:bg-rose-50 dark:hover:bg-rose-900/20 border border-transparent hover:border-rose-400/40 transition text-left">
+          <i class="fa-solid fa-arrows-rotate text-rose-500 mt-0.5"></i>
+          <div>
+            <div class="text-sm font-semibold text-zinc-900 dark:text-white">取代全部</div>
+            <div class="text-[11px] text-zinc-500 dark:text-zinc-400">清除現有資料，只保留匯入的項目</div>
+          </div>
+        </button>
+      </div>
+      <button type="button" @click="cancelImport()"
+              class="w-full mt-3 py-2.5 rounded-xl text-xs font-semibold text-zinc-500 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 transition">
+        取消
+      </button>
+    </div>
+  </div>
+
   <!-- Toast -->
   <div class="fixed bottom-8 left-1/2 -translate-x-1/2 z-[60] pointer-events-none safe-bottom"
        x-show="toasts.length > 0">
