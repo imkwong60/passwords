@@ -17,6 +17,7 @@
   <!-- Local assets only (offline-ready) -->
   <link rel="stylesheet" href="./tailwind-built.css">
   <link rel="stylesheet" href="./fa/all.min.css">
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <script defer src="./alpine.min.js"></script>
   <script src="./app.js"></script>
 
@@ -30,6 +31,40 @@
     body { -webkit-overflow-scrolling: touch; overscroll-behavior: none; }
     [x-cloak] { display: none !important; }
     input, textarea { font-size: 16px !important; } /* prevent iOS zoom */
+
+    /* Missing utilities used by cloud / sync UI */
+    .z-\[70\] { z-index: 70; }
+    .z-\[72\] { z-index: 72; }
+    .z-\[75\] { z-index: 75; }
+    .bg-black\/30 { background-color: rgba(0,0,0,.3); }
+    .bg-brand-50 { background-color: #f0fdfa; }
+    .hover\:bg-brand-100:hover { background-color: #ccfbf1; }
+    .dark .dark\:hover\:bg-brand-900\/60:hover { background-color: rgba(19,78,74,.6); }
+    .space-y-1\.5 > :not([hidden]) ~ :not([hidden]) { margin-top: .375rem; }
+    .space-y-2 > :not([hidden]) ~ :not([hidden]) { margin-top: .5rem; }
+    .rounded-lg { border-radius: .5rem; }
+    .py-1 { padding-top: .25rem; padding-bottom: .25rem; }
+    .px-2\.5 { padding-left: .625rem; padding-right: .625rem; }
+    .pr-8 { padding-right: 2rem; }
+    .right-2 { right: .5rem; }
+    .w-6 { width: 1.5rem; }
+    .h-6 { height: 1.5rem; }
+    .w-2 { width: .5rem; }
+    .h-2 { height: .5rem; }
+    .mr-1 { margin-right: .25rem; }
+    .-top-0\.5 { top: -.125rem; }
+    .-right-0\.5 { right: -.125rem; }
+    .ring-2 { box-shadow: 0 0 0 2px #fff; }
+    .dark .dark\:ring-zinc-900 { box-shadow: 0 0 0 2px #18181b; }
+    .ring-white { --tw-ring-color: #fff; }
+
+    /* Cloud panel: hard size, independent of utility purge */
+    #cloudPanelCard {
+      width: 260px !important;
+      max-width: calc(100vw - 2rem) !important;
+      padding: 0.875rem !important;
+      box-sizing: border-box !important;
+    }
   </style>
 </head>
 <body class="bg-zinc-50 dark:bg-zinc-950 text-zinc-900 dark:text-zinc-100 font-sans antialiased min-h-screen flex flex-col items-center justify-start transition-colors duration-300 overflow-x-hidden"
@@ -124,6 +159,24 @@
         <div class="flex items-center space-x-1">
           <button type="button" @click="toggleTheme()" class="w-8 h-8 rounded-full bg-zinc-100 dark:bg-zinc-800 hover:bg-zinc-200 dark:hover:bg-zinc-700 flex items-center justify-center text-zinc-600 dark:text-zinc-300 transition" title="外觀">
             <i class="fa-solid text-xs" :class="darkMode ? 'fa-sun' : 'fa-moon'"></i>
+          </button>
+          <!-- Cloud sync icon -->
+          <button type="button" @click="cloudPanelOpen = !cloudPanelOpen"
+                  class="relative w-8 h-8 rounded-full flex items-center justify-center transition"
+                  :class="isLoggedIn
+                    ? (syncStatus === 'error'
+                        ? 'bg-rose-100 dark:bg-rose-900/40 text-rose-600 dark:text-rose-400'
+                        : 'bg-brand-50 dark:bg-brand-900/40 text-brand-600 dark:text-brand-400 hover:bg-brand-100 dark:hover:bg-brand-900/60')
+                    : 'bg-zinc-100 dark:bg-zinc-800 text-zinc-500 dark:text-zinc-400 hover:bg-zinc-200 dark:hover:bg-zinc-700'"
+                  :title="isLoggedIn ? (authEmail || '雲端同步') : '雲端登入'">
+            <i class="fa-solid text-xs"
+               :class="syncStatus === 'pulling' || syncStatus === 'pushing' ? 'fa-cloud fa-beat-fade' : (isLoggedIn ? 'fa-cloud' : 'fa-cloud')"></i>
+            <span x-show="isLoggedIn && syncStatus === 'synced'"
+                  class="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-emerald-500 ring-2 ring-white dark:ring-zinc-900"></span>
+            <span x-show="isLoggedIn && (syncStatus === 'pulling' || syncStatus === 'pushing')"
+                  class="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-amber-400 ring-2 ring-white dark:ring-zinc-900"></span>
+            <span x-show="isLoggedIn && syncStatus === 'error'"
+                  class="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-rose-500 ring-2 ring-white dark:ring-zinc-900"></span>
           </button>
           <button type="button" @click="lock()" class="w-8 h-8 rounded-full bg-zinc-100 dark:bg-zinc-800 hover:bg-zinc-200 dark:hover:bg-zinc-700 flex items-center justify-center text-zinc-600 dark:text-zinc-300 transition" title="鎖定">
             <i class="fa-solid fa-lock text-xs"></i>
@@ -380,6 +433,138 @@
       <button type="button" @click="cancelImport()"
               class="w-full mt-3 py-2.5 rounded-xl text-xs font-semibold text-zinc-500 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 transition">
         取消
+      </button>
+    </div>
+  </div>
+
+  <!-- ═══════════════ CLOUD PANEL ═══════════════ -->
+  <div x-show="cloudPanelOpen"
+       x-cloak
+       class="fixed inset-0 z-[72] bg-black/30 flex items-start justify-center p-4"
+       style="padding-top: 4.5rem;"
+       @keydown.escape.window="cloudPanelOpen = false">
+    <div class="absolute inset-0" @click="cloudPanelOpen = false"></div>
+    <div id="cloudPanelCard"
+         class="relative bg-white dark:bg-zinc-900 rounded-2xl shadow-2xl border border-zinc-200 dark:border-zinc-800 animate-fade-in"
+         @click.stop>
+      <div class="flex items-center justify-between mb-2">
+        <div class="flex items-center gap-1.5 min-w-0">
+          <i class="fa-solid fa-cloud text-brand-600 dark:text-brand-400 text-xs"></i>
+          <span class="text-xs font-bold text-zinc-900 dark:text-white">雲端同步</span>
+        </div>
+        <button type="button" @click="cloudPanelOpen = false"
+                class="w-6 h-6 rounded-full hover:bg-zinc-100 dark:hover:bg-zinc-800 flex items-center justify-center text-zinc-400">
+          <i class="fa-solid fa-xmark text-xs"></i>
+        </button>
+      </div>
+
+      <div x-show="isLoggedIn" class="space-y-2">
+        <div class="text-[11px] text-zinc-600 dark:text-zinc-300 truncate" x-text="authEmail"></div>
+        <div class="flex items-center justify-between gap-2">
+          <span class="text-[10px] px-1.5 py-0.5 rounded-full font-semibold border"
+                :class="{
+                  'bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-900/30 dark:text-emerald-300 dark:border-emerald-800': syncStatus === 'synced',
+                  'bg-amber-50 text-amber-700 border-amber-200 dark:bg-amber-900/30 dark:text-amber-300 dark:border-amber-800': syncStatus === 'pulling' || syncStatus === 'pushing',
+                  'bg-rose-50 text-rose-700 border-rose-200 dark:bg-rose-900/30 dark:text-rose-300 dark:border-rose-800': syncStatus === 'error',
+                  'bg-zinc-50 text-zinc-500 border-zinc-200 dark:bg-zinc-800 dark:text-zinc-400 dark:border-zinc-700': syncStatus === 'idle'
+                }"
+                x-text="syncStatus === 'synced' ? '已同步' : (syncStatus === 'pulling' ? '下載中' : (syncStatus === 'pushing' ? '上傳中' : (syncStatus === 'error' ? '錯誤' : '待命')))"></span>
+          <button type="button" @click="pullFromCloud()"
+                  class="text-[11px] font-semibold text-brand-600 dark:text-brand-400 disabled:opacity-50"
+                  :disabled="syncStatus === 'pulling' || syncStatus === 'pushing' || !isOnline">
+            <i class="fa-solid fa-arrows-rotate text-[9px]" :class="{'fa-spin': syncStatus === 'pulling' || syncStatus === 'pushing'}"></i> 同步
+          </button>
+        </div>
+        <button type="button" @click="authLogout()"
+                class="w-full py-1.5 rounded-xl text-[11px] font-medium text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                :disabled="authLoading">登出</button>
+      </div>
+
+      <div x-show="!isLoggedIn" class="space-y-1.5">
+        <div class="flex rounded-xl bg-zinc-100 dark:bg-zinc-800 p-0.5 text-[11px] font-semibold">
+          <button type="button" @click="switchAuthMode('login')"
+                  class="flex-1 py-1 rounded-lg transition"
+                  :class="authMode === 'login' ? 'bg-white dark:bg-zinc-700 text-zinc-900 dark:text-white shadow-sm' : 'text-zinc-500'">登入</button>
+          <button type="button" @click="switchAuthMode('register')"
+                  class="flex-1 py-1 rounded-lg transition"
+                  :class="authMode === 'register' ? 'bg-white dark:bg-zinc-700 text-zinc-900 dark:text-white shadow-sm' : 'text-zinc-500'">註冊</button>
+        </div>
+        <form @submit.prevent="authSubmit()" class="space-y-1.5">
+          <input type="email" x-model="authEmail" placeholder="Email" autocomplete="username"
+                 class="w-full px-2.5 py-1.5 bg-zinc-100 dark:bg-zinc-800 rounded-xl text-xs focus:outline-none focus:ring-2 focus:ring-brand-500"
+                 :disabled="authLoading">
+          <div class="relative">
+            <input :type="showAuthPassword ? 'text' : 'password'" x-model="authPassword"
+                   :placeholder="authMode === 'register' ? '密碼（≥6）' : '密碼'"
+                   autocomplete="current-password"
+                   class="w-full px-2.5 py-1.5 pr-8 bg-zinc-100 dark:bg-zinc-800 rounded-xl text-xs focus:outline-none focus:ring-2 focus:ring-brand-500"
+                   :disabled="authLoading">
+            <button type="button" @click="showAuthPassword = !showAuthPassword"
+                    class="absolute right-2 top-1/2 -translate-y-1/2 text-zinc-400">
+              <i class="fa-solid text-[10px]" :class="showAuthPassword ? 'fa-eye-slash' : 'fa-eye'"></i>
+            </button>
+          </div>
+          <div x-show="authMode === 'register'">
+            <input :type="showAuthPassword ? 'text' : 'password'" x-model="authConfirmPassword"
+                   placeholder="確認密碼" autocomplete="new-password"
+                   class="w-full px-2.5 py-1.5 bg-zinc-100 dark:bg-zinc-800 rounded-xl text-xs focus:outline-none focus:ring-2 focus:ring-brand-500"
+                   :disabled="authLoading">
+          </div>
+          <p x-show="authError" class="text-[10px] text-rose-600 dark:text-rose-400" x-text="authError"></p>
+          <button type="submit"
+                  class="w-full py-1.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white text-[11px] font-semibold disabled:opacity-50"
+                  :disabled="authLoading || !isOnline">
+            <span x-show="authLoading"><i class="fa-solid fa-spinner fa-spin mr-1"></i>…</span>
+            <span x-show="!authLoading" x-text="authMode === 'register' ? '註冊' : '登入'"></span>
+          </button>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════ CONFLICT DIALOG ═══════════════ -->
+  <div x-show="conflictDialogOpen"
+       x-cloak
+       class="fixed inset-0 z-[75] bg-black/50 backdrop-blur-sm flex items-center justify-center p-4"
+       @keydown.escape.window="cancelConflict()">
+    <div class="absolute inset-0" @click="cancelConflict()"></div>
+    <div class="relative w-full max-w-sm bg-white dark:bg-zinc-900 rounded-3xl shadow-2xl border border-zinc-200 dark:border-zinc-800 p-5 animate-fade-in"
+         @click.stop>
+      <div class="flex items-center gap-3 mb-3">
+        <div class="w-10 h-10 rounded-2xl bg-amber-500/15 flex items-center justify-center text-amber-600 dark:text-amber-400">
+          <i class="fa-solid fa-triangle-exclamation text-sm"></i>
+        </div>
+        <div>
+          <h3 class="font-bold text-sm text-zinc-900 dark:text-white">資料衝突</h3>
+          <p class="text-[11px] text-zinc-500 dark:text-zinc-400">本機與雲端內容不同</p>
+        </div>
+      </div>
+      <p class="text-[12px] text-zinc-600 dark:text-zinc-300 leading-relaxed mb-1">
+        雲端有 <span class="font-semibold" x-text="(conflictCloudData || []).length"></span> 筆，
+        本機有 <span class="font-semibold" x-text="passwords.length"></span> 筆。
+      </p>
+      <p class="text-[11px] text-zinc-500 dark:text-zinc-400 mb-4">請選擇要保留的版本（另一方會被覆蓋）。</p>
+      <div class="space-y-2">
+        <button type="button" @click="resolveConflict('local')"
+                class="w-full flex items-start gap-3 px-3.5 py-3 rounded-2xl bg-zinc-100 dark:bg-zinc-800 hover:bg-brand-50 dark:hover:bg-brand-900/30 border border-transparent hover:border-brand-500/40 transition text-left">
+          <i class="fa-solid fa-mobile-screen text-brand-600 dark:text-brand-400 mt-0.5"></i>
+          <div>
+            <div class="text-sm font-semibold text-zinc-900 dark:text-white">使用本機資料</div>
+            <div class="text-[11px] text-zinc-500 dark:text-zinc-400">上傳本機，覆蓋雲端</div>
+          </div>
+        </button>
+        <button type="button" @click="resolveConflict('cloud')"
+                class="w-full flex items-start gap-3 px-3.5 py-3 rounded-2xl bg-zinc-100 dark:bg-zinc-800 hover:bg-amber-50 dark:hover:bg-amber-900/20 border border-transparent hover:border-amber-400/40 transition text-left">
+          <i class="fa-solid fa-cloud text-amber-500 mt-0.5"></i>
+          <div>
+            <div class="text-sm font-semibold text-zinc-900 dark:text-white">使用雲端資料</div>
+            <div class="text-[11px] text-zinc-500 dark:text-zinc-400">下載雲端，覆蓋本機</div>
+          </div>
+        </button>
+      </div>
+      <button type="button" @click="cancelConflict()"
+              class="w-full mt-3 py-2.5 rounded-xl text-xs font-semibold text-zinc-500 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 transition">
+        稍後再決定
       </button>
     </div>
   </div>
