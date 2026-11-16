@@ -61,6 +61,7 @@ function passwordManager() {
     importPreview: [],
     _cryptoKey: null,
     _salt: null,
+    _masterPassword: null, // 解鎖期間暫存，供跨裝置雲端解密（lock 時清除）
 
     // ── Supabase Auth / Sync ───────────────────────────────
     authUser: null,
@@ -312,6 +313,7 @@ function passwordManager() {
         const salt = crypto.getRandomValues(new Uint8Array(CRYPTO.SALT_BYTES));
         this._salt = salt;
         this._cryptoKey = await this._deriveKey(pw, salt, CRYPTO.PBKDF2_ITERATIONS);
+        this._masterPassword = pw;
         this.pbkdf2Iterations = CRYPTO.PBKDF2_ITERATIONS;
         this._writeMeta({
           version: 1,
@@ -356,6 +358,7 @@ function passwordManager() {
           : CRYPTO.PBKDF2_ITERATIONS;
         this.pbkdf2Iterations = storedIters;
         this._cryptoKey = await this._deriveKey(pw, salt, storedIters);
+        this._masterPassword = pw;
         this.passwords = await this._loadVault();
         this.passwords = this.passwords.map((p, i) => ({
           ...p,
@@ -388,6 +391,7 @@ function passwordManager() {
       } catch (err) {
         console.error(err);
         this._cryptoKey = null;
+        this._masterPassword = null;
         this.unlockError = '主密碼錯誤或資料損毀';
       } finally {
         this.isProcessing = false;
@@ -403,6 +407,7 @@ function passwordManager() {
         this._clearSyncTimer();
       }
       this._cryptoKey = null;
+      this._masterPassword = null;
       this.passwords = [];
       this.isUnlocked = false;
       this.isLocked = true;
@@ -545,12 +550,27 @@ function passwordManager() {
     },
 
     /**
-     * 雲端 payload：用目前已解鎖的 _cryptoKey（主密碼衍生）做 AES-GCM 加密。
-     * 結構：{ v: 2, enc: true, iv, data } — 明文不會上雲。
-     * 拉取時用同一把記憶體金鑰自動解密，不必再輸入密碼。
+     * 雲端 payload（跨裝置可解）：
+     * 封包裝有 salt + iterations（非秘密），密文用 PBKDF2(主密碼, salt, iters) 加密。
+     * 另一台機器只要主密碼相同，即可重新派生金鑰解密，不依賴本機 localStorage salt。
+     * 結構：{ v:3, enc:true, salt, iterations, iv, data }
      */
     async _buildCloudPayloadEncrypted() {
-      if (!this._cryptoKey) throw new Error('尚未解鎖，無法加密上傳');
+      if (!this._cryptoKey || !this._masterPassword) {
+        throw new Error('尚未解鎖，無法加密上傳');
+      }
+      // 確保有可上傳的 salt（base64）
+      let saltB64;
+      let iterations = this.pbkdf2Iterations || CRYPTO.PBKDF2_ITERATIONS;
+      if (this._salt) {
+        saltB64 = this._bufToB64(this._salt);
+      } else {
+        const meta = this._readMeta();
+        saltB64 = meta?.salt;
+        if (typeof meta?.iterations === 'number') iterations = meta.iterations;
+      }
+      if (!saltB64) throw new Error('缺少 salt，無法上傳');
+
       const clean = this.passwords.map(({ _noteOpen, _pwdVisible, ...rest }) => rest);
       const plain = {
         passwords: clean,
@@ -559,33 +579,53 @@ function passwordManager() {
           clientUpdatedAt: new Date().toISOString(),
         },
       };
-      const sealed = await this._encrypt(plain, this._cryptoKey);
+      // 用「會寫進封包的 salt/iters」派生的 key 加密，保證他機能用同一組參數解開
+      const saltBuf = this._b64ToBuf(saltB64);
+      const cloudKey = await this._deriveKey(this._masterPassword, saltBuf, iterations);
+      const sealed = await this._encrypt(plain, cloudKey);
       return {
-        v: 2,
+        v: 3,
         enc: true,
+        salt: saltB64,
+        iterations,
         iv: sealed.iv,
         data: sealed.data,
       };
     },
 
-    /** 解析雲端 data：支援加密(v2)與舊明文(相容)，回傳 passwords 陣列 */
+    /** 解析雲端 data：v3（含 salt）/ 舊 v2（僅本機 key）/ 明文相容 */
     async _decodeCloudData(cloudPayload) {
       if (!cloudPayload) return [];
 
-      // 加密格式：{ v:2, enc:true, iv, data }
+      // 加密格式
       if (cloudPayload && cloudPayload.enc === true && cloudPayload.iv && cloudPayload.data) {
-        if (!this._cryptoKey) throw new Error('尚未解鎖，無法解密雲端資料');
         try {
+          let key = null;
+          // v3+：封包自帶 salt → 用主密碼重新派生（跨裝置）
+          if (cloudPayload.salt && this._masterPassword) {
+            const iters = (typeof cloudPayload.iterations === 'number' && cloudPayload.iterations > 0)
+              ? cloudPayload.iterations
+              : CRYPTO.PBKDF2_ITERATIONS;
+            const saltBuf = this._b64ToBuf(cloudPayload.salt);
+            key = await this._deriveKey(this._masterPassword, saltBuf, iters);
+          } else if (this._cryptoKey) {
+            // 舊 v2：沒有 salt，只能用本機金鑰（同裝置）
+            key = this._cryptoKey;
+          } else {
+            throw new Error('尚未解鎖，無法解密雲端資料');
+          }
           const plain = await this._decrypt(
             { iv: cloudPayload.iv, data: cloudPayload.data },
-            this._cryptoKey
+            key
           );
           if (Array.isArray(plain)) return plain;
           if (plain && Array.isArray(plain.passwords)) return plain.passwords;
           return [];
         } catch (e) {
           console.error('[cloud decrypt]', e);
-          throw new Error('雲端資料解密失敗（可能主密碼不同）');
+          const msg = (e && e.message) ? String(e.message) : '';
+          if (/主密碼|尚未解鎖/.test(msg)) throw e;
+          throw new Error('雲端資料解密失敗（請確認兩端使用相同主密碼）');
         }
       }
 
@@ -630,14 +670,13 @@ function passwordManager() {
           return;
         }
 
-        // 舊明文：自動升級為加密後再存回（背景，不擋主流程）
+        // 舊明文或舊 v2（無 salt）：同步成功後升級為 v3 封包
         const raw = data.data;
         const isLegacyPlain = raw && raw.enc !== true && (
           Array.isArray(raw) || (raw && Array.isArray(raw.passwords))
         );
-        if (isLegacyPlain && cloudList) {
-          // 下一輪 push 會寫入加密版
-        }
+        const needsEnvelopeUpgrade = raw && raw.enc === true && !raw.salt;
+        const shouldUpgrade = isLegacyPlain || needsEnvelopeUpgrade;
 
         const localClean = this.passwords.map(({ _noteOpen, _pwdVisible, ...r }) => r);
         const localStr = JSON.stringify(localClean);
@@ -647,7 +686,7 @@ function passwordManager() {
           this.syncStatus = 'synced';
           this.lastSyncedAt = data.updated_at;
           // 若仍是舊明文，順手升級加密
-          if (isLegacyPlain) await this.pushToCloud({ force: true });
+          if (shouldUpgrade) await this.pushToCloud({ force: true });
           if (!silent) this.showToast('已與雲端同步', 'success');
           return;
         }
@@ -656,7 +695,7 @@ function passwordManager() {
           this._applyCloudList(cloudList);
           this.syncStatus = 'synced';
           this.lastSyncedAt = data.updated_at;
-          if (isLegacyPlain) await this.pushToCloud({ force: true });
+          if (shouldUpgrade) await this.pushToCloud({ force: true });
           if (!silent) this.showToast('已從雲端載入 ' + cloudList.length + ' 筆', 'success');
           return;
         }
