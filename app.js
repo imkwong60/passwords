@@ -61,7 +61,6 @@ function passwordManager() {
     importPreview: [],
     _cryptoKey: null,
     _salt: null,
-    _masterPassword: null, // 解鎖期間暫存，供跨裝置雲端解密（lock 時清除）
 
     // ── Supabase Auth / Sync ───────────────────────────────
     authUser: null,
@@ -314,7 +313,6 @@ function passwordManager() {
         const salt = crypto.getRandomValues(new Uint8Array(CRYPTO.SALT_BYTES));
         this._salt = salt;
         this._cryptoKey = await this._deriveKey(pw, salt, CRYPTO.PBKDF2_ITERATIONS);
-        this._masterPassword = pw;
         this.pbkdf2Iterations = CRYPTO.PBKDF2_ITERATIONS;
         this._writeMeta({
           version: 1,
@@ -331,7 +329,7 @@ function passwordManager() {
         this.confirmPasswordInput = '';
         this.showToast('主密碼已設定，資料已加密保護', 'success');
         if (this.isLoggedIn) {
-          this.pullFromCloud({ silent: true });
+          this.pullFromCloud({ silent: true, password: pw });
         }
       } catch (err) {
         console.error(err);
@@ -359,7 +357,6 @@ function passwordManager() {
           : CRYPTO.PBKDF2_ITERATIONS;
         this.pbkdf2Iterations = storedIters;
         this._cryptoKey = await this._deriveKey(pw, salt, storedIters);
-        this._masterPassword = pw;
         this.passwords = await this._loadVault();
         this.passwords = this.passwords.map((p, i) => ({
           ...p,
@@ -387,12 +384,12 @@ function passwordManager() {
         this.masterPasswordInput = '';
         this.showToast('已解鎖', 'success');
         if (this.isLoggedIn) {
-          this.pullFromCloud({ silent: false });
+          // 僅在此瞬間把密碼傳入 pull，用於跨裝置 salt 對齊；不駐留狀態
+          this.pullFromCloud({ silent: false, password: pw });
         }
       } catch (err) {
         console.error(err);
         this._cryptoKey = null;
-        this._masterPassword = null;
         this.unlockError = '主密碼錯誤或資料損毀';
       } finally {
         this.isProcessing = false;
@@ -400,18 +397,20 @@ function passwordManager() {
     },
 
     lock() {
-      // 若有待發 push：先 snapshot，立刻清空記憶體，再非同步上傳（不阻塞鎖定）
-      const shouldFlush = !!(this._syncTimer && this._cryptoKey && this.isLoggedIn && this.isOnline && this._masterPassword);
+      // snapshot：保留不可導出的 CryptoKey + 清單 + salt，立刻清空 UI 狀態
+      const shouldFlush = !!(this._syncTimer && this._cryptoKey && this.isLoggedIn && this.isOnline);
       this._clearSyncTimer();
       let flushSnap = null;
       if (shouldFlush) {
         try {
+          const saltB64 = this._salt
+            ? this._bufToB64(this._salt)
+            : (this._readMeta()?.salt || null);
           flushSnap = {
             owner: this.authUser?.id,
+            key: this._cryptoKey, // extractable:false，XSS 也無法匯出原始位元組
             passwords: this.passwords.map(({ _noteOpen, _pwdVisible, ...rest }) => rest),
-            masterPassword: this._masterPassword,
-            salt: this._salt,
-            saltB64: this._salt ? this._bufToB64(this._salt) : (this._readMeta()?.salt || null),
+            saltB64,
             iterations: this.pbkdf2Iterations || CRYPTO.PBKDF2_ITERATIONS,
           };
         } catch (e) {
@@ -420,9 +419,8 @@ function passwordManager() {
         }
       }
 
-      // 核心鎖定：同步立即執行
+      // 核心鎖定：同步立即執行（不等待網路）
       this._cryptoKey = null;
-      this._masterPassword = null;
       this.passwords = [];
       this.isUnlocked = false;
       this.isLocked = true;
@@ -439,23 +437,21 @@ function passwordManager() {
       } catch {}
 
       if (flushSnap) {
-        this._flushPushSnapshot(flushSnap).catch((e) => console.warn('[flush on lock]', e));
+        this._flushWithKey(flushSnap).catch((e) => console.warn('[flush on lock]', e));
       }
     },
 
-    /** 用鎖定前 snapshot 上傳（金鑰已從 UI 狀態清除） */
-    async _flushPushSnapshot(snap) {
-      if (!snap?.owner || !snap.masterPassword || !snap.saltB64) return;
+    /** 用鎖定前 snapshot 的 CryptoKey 加密上傳（不經主密碼字串） */
+    async _flushWithKey(snap) {
+      if (!snap?.owner || !snap.key || !snap.saltB64) return;
       const sb = getSupabase();
       if (!sb || !navigator.onLine) return;
       try {
-        const saltBuf = this._b64ToBuf(snap.saltB64);
-        const key = await this._deriveKey(snap.masterPassword, saltBuf, snap.iterations);
         const plain = {
-          passwords: snap.passwords,
-          meta: { count: snap.passwords.length, clientUpdatedAt: new Date().toISOString() },
+          passwords: snap.passwords || [],
+          meta: { count: (snap.passwords || []).length, clientUpdatedAt: new Date().toISOString() },
         };
-        const sealed = await this._encrypt(plain, key);
+        const sealed = await this._encrypt(plain, snap.key);
         const payload = {
           v: 3,
           enc: true,
@@ -471,8 +467,7 @@ function passwordManager() {
           updated_at: new Date().toISOString(),
         }, { onConflict: 'owner,app' });
       } finally {
-        // 盡力清除 snapshot 內敏感欄位
-        snap.masterPassword = null;
+        snap.key = null;
         snap.passwords = null;
       }
     },
@@ -604,16 +599,13 @@ function passwordManager() {
     },
 
     /**
-     * 雲端 payload（跨裝置可解）：
-     * 封包裝有 salt + iterations（非秘密），密文用 PBKDF2(主密碼, salt, iters) 加密。
-     * 另一台機器只要主密碼相同，即可重新派生金鑰解密，不依賴本機 localStorage salt。
+     * 雲端 payload：用已解鎖的 _cryptoKey（extractable:false）加密。
+     * 封包附帶本機 salt + iterations，供他機在「解鎖當下」用主密碼對齊 salt。
      * 結構：{ v:3, enc:true, salt, iterations, iv, data }
+     * 不在狀態中保存主密碼明文。
      */
     async _buildCloudPayloadEncrypted() {
-      if (!this._cryptoKey || !this._masterPassword) {
-        throw new Error('尚未解鎖，無法加密上傳');
-      }
-      // 確保有可上傳的 salt（base64）
+      if (!this._cryptoKey) throw new Error('尚未解鎖，無法加密上傳');
       let saltB64;
       let iterations = this.pbkdf2Iterations || CRYPTO.PBKDF2_ITERATIONS;
       if (this._salt) {
@@ -633,10 +625,7 @@ function passwordManager() {
           clientUpdatedAt: new Date().toISOString(),
         },
       };
-      // 用「會寫進封包的 salt/iters」派生的 key 加密，保證他機能用同一組參數解開
-      const saltBuf = this._b64ToBuf(saltB64);
-      const cloudKey = await this._deriveKey(this._masterPassword, saltBuf, iterations);
-      const sealed = await this._encrypt(plain, cloudKey);
+      const sealed = await this._encrypt(plain, this._cryptoKey);
       return {
         v: 3,
         enc: true,
@@ -647,49 +636,92 @@ function passwordManager() {
       };
     },
 
-    /** 解析雲端 data：v3（含 salt）/ 舊 v2（僅本機 key）/ 明文相容 */
-    async _decodeCloudData(cloudPayload) {
-      if (!cloudPayload) return [];
+    /**
+     * 解密雲端 data。
+     * - 同 salt → 直接用 _cryptoKey
+     * - 不同 salt 且提供了 password（僅 unlock 當下）→ 臨時派生、用完不保存
+     * - 不同 salt 且無 password → 拋錯提示重新解鎖以對齊
+     */
+    async _decodeCloudData(cloudPayload, password = null) {
+      if (!cloudPayload) return { list: [], adopted: false };
 
-      // 加密格式
       if (cloudPayload && cloudPayload.enc === true && cloudPayload.iv && cloudPayload.data) {
         try {
+          const localSaltB64 = this._salt
+            ? this._bufToB64(this._salt)
+            : (this._readMeta()?.salt || null);
+          const cloudSalt = cloudPayload.salt || null;
+          const cloudIters = (typeof cloudPayload.iterations === 'number' && cloudPayload.iterations > 0)
+            ? cloudPayload.iterations
+            : CRYPTO.PBKDF2_ITERATIONS;
+
           let key = null;
-          // v3+：封包自帶 salt → 用主密碼重新派生（跨裝置）
-          if (cloudPayload.salt && this._masterPassword) {
-            const iters = (typeof cloudPayload.iterations === 'number' && cloudPayload.iterations > 0)
-              ? cloudPayload.iterations
-              : CRYPTO.PBKDF2_ITERATIONS;
-            const saltBuf = this._b64ToBuf(cloudPayload.salt);
-            key = await this._deriveKey(this._masterPassword, saltBuf, iters);
-          } else if (this._cryptoKey) {
-            // 舊 v2：沒有 salt，只能用本機金鑰（同裝置）
+          let needAdopt = false;
+
+          if (!cloudSalt) {
+            // 舊 v2：無 salt，只能同裝置
+            if (!this._cryptoKey) throw new Error('尚未解鎖，無法解密雲端資料');
             key = this._cryptoKey;
+          } else if (localSaltB64 && cloudSalt === localSaltB64) {
+            if (!this._cryptoKey) throw new Error('尚未解鎖，無法解密雲端資料');
+            key = this._cryptoKey;
+          } else if (password) {
+            // 跨裝置：用解鎖當下的密碼臨時派生（不寫入 this）
+            key = await this._deriveKey(password, this._b64ToBuf(cloudSalt), cloudIters);
+            needAdopt = true;
           } else {
-            throw new Error('尚未解鎖，無法解密雲端資料');
+            throw new Error('雲端金鑰參數與本機不同，請鎖定後重新解鎖以同步');
           }
+
           const plain = await this._decrypt(
             { iv: cloudPayload.iv, data: cloudPayload.data },
             key
           );
-          if (Array.isArray(plain)) return plain;
-          if (plain && Array.isArray(plain.passwords)) return plain.passwords;
-          return [];
+          let list = [];
+          if (Array.isArray(plain)) list = plain;
+          else if (plain && Array.isArray(plain.passwords)) list = plain.passwords;
+
+          // 若需對齊 salt：把雲端 salt 寫入本機 meta，並用 password 重派生 _cryptoKey
+          if (needAdopt && password && cloudSalt) {
+            await this._adoptCloudKdf(password, cloudSalt, cloudIters);
+          }
+
+          return { list, adopted: needAdopt };
         } catch (e) {
           console.error('[cloud decrypt]', e);
           const msg = (e && e.message) ? String(e.message) : '';
-          if (/主密碼|尚未解鎖/.test(msg)) throw e;
-          throw new Error('雲端資料解密失敗（請確認兩端使用相同主密碼）');
+          if (/尚未解鎖|重新解鎖|金鑰參數/.test(msg)) throw e;
+          throw new Error('雲端資料解密失敗（請確認主密碼相同）');
         }
       }
 
       // 舊版明文相容
-      if (Array.isArray(cloudPayload)) return cloudPayload;
-      if (cloudPayload && Array.isArray(cloudPayload.passwords)) return cloudPayload.passwords;
-      return [];
+      if (Array.isArray(cloudPayload)) return { list: cloudPayload, adopted: false };
+      if (cloudPayload && Array.isArray(cloudPayload.passwords)) {
+        return { list: cloudPayload.passwords, adopted: false };
+      }
+      return { list: [], adopted: false };
     },
 
-    async pullFromCloud({ silent = false } = {}) {
+    /** 採用雲端 salt/iterations 為本機 KDF 參數，並重寫本地 vault */
+    async _adoptCloudKdf(password, cloudSaltB64, cloudIters) {
+      const saltBuf = this._b64ToBuf(cloudSaltB64);
+      const newKey = await this._deriveKey(password, saltBuf, cloudIters);
+      this._salt = saltBuf;
+      this._cryptoKey = newKey;
+      this.pbkdf2Iterations = cloudIters;
+      const prevMeta = this._readMeta() || {};
+      this._writeMeta({
+        ...prevMeta,
+        version: prevMeta.version || 1,
+        salt: cloudSaltB64,
+        iterations: cloudIters,
+        adoptedFromCloudAt: Date.now(),
+      });
+      await this._saveVault();
+    },
+
+    async pullFromCloud({ silent = false, password = null } = {}) {
       if (!this.isLoggedIn || !this.isUnlocked || !this._cryptoKey) return;
       const sb = getSupabase();
       if (!sb || !this.isOnline) {
@@ -715,22 +747,24 @@ function passwordManager() {
         }
 
         this.cloudUpdatedAt = data.updated_at;
-        let cloudList;
+        let cloudList = [];
+        let adopted = false;
         try {
-          cloudList = await this._decodeCloudData(data.data);
+          const decoded = await this._decodeCloudData(data.data, password);
+          cloudList = decoded.list || [];
+          adopted = !!decoded.adopted;
         } catch (decErr) {
           this.syncStatus = 'error';
           if (!silent) this.showToast(decErr.message || '雲端解密失敗', 'error');
           return;
         }
 
-        // 舊明文或舊 v2（無 salt）：同步成功後升級為 v3 封包
         const raw = data.data;
         const isLegacyPlain = raw && raw.enc !== true && (
           Array.isArray(raw) || (raw && Array.isArray(raw.passwords))
         );
         const needsEnvelopeUpgrade = raw && raw.enc === true && !raw.salt;
-        const shouldUpgrade = isLegacyPlain || needsEnvelopeUpgrade;
+        const shouldUpgrade = isLegacyPlain || needsEnvelopeUpgrade || adopted;
 
         const localClean = this.passwords.map(({ _noteOpen, _pwdVisible, ...r }) => r);
         const localStr = JSON.stringify(localClean);
@@ -739,7 +773,6 @@ function passwordManager() {
         if (localStr === cloudStr) {
           this.syncStatus = 'synced';
           this.lastSyncedAt = data.updated_at;
-          // 若仍是舊明文，順手升級加密
           if (shouldUpgrade) await this.pushToCloud({ force: true });
           if (!silent) this.showToast('已與雲端同步', 'success');
           return;
@@ -760,6 +793,7 @@ function passwordManager() {
           return;
         }
 
+        // 兩邊都有且不同：衝突（salt 已在 decode 時對齊，若有 password）
         this.conflictCloudData = cloudList;
         this.conflictCloudUpdatedAt = data.updated_at;
         this.conflictDialogOpen = true;
