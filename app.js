@@ -1,6 +1,7 @@
 /**
  * 分享本本 – Secure local password manager
  * AES-GCM + PBKDF2 (120k iterations) · Offline-first
+ * + Supabase Email 登入與 app_data 同步
  */
 const CRYPTO = {
   PBKDF2_ITERATIONS: 120_000,
@@ -8,6 +9,30 @@ const CRYPTO = {
   IV_BYTES: 12,
   KEY_BITS: 256,
 };
+
+const SUPABASE_URL = 'https://wanknivxcsrasdkkxmfr.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6IndhbmtuaXZ4Y3NyYXNka2t4bWZyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODczMzE4NjcsImV4cCI6MjEwMjkwNzg2N30.tqsFimERtYCxoh8J-8FlqxByWtX2gNnyaGo08jditrs';
+/** 本專案在 app_data.app 的固定白名單值 */
+const APP_ID = 'sharebook';
+const SYNC_DEBOUNCE_MS = 2500;
+
+let _supabase = null;
+function getSupabase() {
+  if (_supabase) return _supabase;
+  if (typeof supabase === 'undefined' || !supabase.createClient) {
+    console.warn('[分享本本] Supabase SDK 尚未載入');
+    return null;
+  }
+  _supabase = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+    auth: {
+      persistSession: true,
+      autoRefreshToken: true,
+      detectSessionInUrl: true,
+      storage: localStorage,
+    },
+  });
+  return _supabase;
+}
 
 function passwordManager() {
   return {
@@ -36,6 +61,25 @@ function passwordManager() {
     _cryptoKey: null,
     _salt: null,
 
+    // ── Supabase Auth / Sync ───────────────────────────────
+    authUser: null,
+    authEmail: '',
+    authPassword: '',
+    authConfirmPassword: '',
+    authMode: 'login', // 'login' | 'register'
+    authError: '',
+    authLoading: false,
+    showAuthPassword: false,
+    syncStatus: 'idle', // idle | pulling | pushing | error | synced
+    lastSyncedAt: null,
+    cloudUpdatedAt: null,
+    _syncTimer: null,
+    _skipNextPush: false,
+    conflictDialogOpen: false,
+    conflictCloudData: null,
+    conflictCloudUpdatedAt: null,
+    cloudPanelOpen: false,
+
     // ── Computed ───────────────────────────────────────────
     get filteredPasswords() {
       const q = (this.searchQuery || '').trim().toLowerCase();
@@ -48,24 +92,30 @@ function passwordManager() {
       );
     },
 
+    get isLoggedIn() {
+      return !!(this.authUser && this.authUser.id);
+    },
+
     // ── Lifecycle ──────────────────────────────────────────
     async init() {
       this._loadTheme();
-      window.addEventListener('online', () => this.isOnline = true);
-      window.addEventListener('offline', () => this.isOnline = false);
+      window.addEventListener('online', () => {
+        this.isOnline = true;
+        if (this.isUnlocked && this.isLoggedIn) this.pullFromCloud({ silent: true });
+      });
+      window.addEventListener('offline', () => { this.isOnline = false; });
       window.addEventListener('storage', (e) => {
-        // 僅在本分頁尚未鎖定時回應，避免 lock() setItem 造成跨 tab 無限 ping-pong
         if (e.key === 'sharebook_lock_signal' && e.newValue && !this.isLocked) {
           this.lock();
         }
       });
-      // Lock on page hide / visibility change for better security
       document.addEventListener('visibilitychange', () => {
         if (document.visibilityState === 'hidden' && this.isUnlocked) {
-          // Soft lock on background is optional; full lock on unload
+          // soft lock optional
         }
       });
       await this._bootstrap();
+      await this._initAuth();
     },
 
     async _bootstrap() {
@@ -79,7 +129,6 @@ function passwordManager() {
         this.isUnlocked = false;
         this.isFirstSetup = false;
       } else if (plain) {
-        // Migrate path: has unencrypted data
         this.hasMasterPassword = false;
         this.isFirstSetup = true;
         this.isLocked = true;
@@ -90,12 +139,38 @@ function passwordManager() {
           this.passwords = [];
         }
       } else {
-        // Fresh install
         this.hasMasterPassword = false;
         this.isFirstSetup = true;
         this.isLocked = true;
         this.isUnlocked = false;
         this.passwords = [];
+      }
+    },
+
+    async _initAuth() {
+      const sb = getSupabase();
+      if (!sb) return;
+      try {
+        const { data: { session } } = await sb.auth.getSession();
+        this.authUser = session?.user ?? null;
+        if (this.authUser) {
+          this.authEmail = this.authUser.email || '';
+        }
+        sb.auth.onAuthStateChange((event, session) => {
+          this.authUser = session?.user ?? null;
+          if (this.authUser) {
+            this.authEmail = this.authUser.email || '';
+            if (this.isUnlocked && event === 'SIGNED_IN') {
+              this.pullFromCloud({ silent: false });
+            }
+          } else {
+            this.syncStatus = 'idle';
+            this.lastSyncedAt = null;
+            this.cloudUpdatedAt = null;
+          }
+        });
+      } catch (e) {
+        console.warn('[auth]', e);
       }
     },
 
@@ -183,12 +258,11 @@ function passwordManager() {
     },
     async _saveVault() {
       if (!this._cryptoKey) return;
-      // 剝離 UI-only 欄位，避免污染加密資料模型
       const clean = this.passwords.map(({ _noteOpen, ...rest }) => rest);
       const payload = await this._encrypt(clean, this._cryptoKey);
       localStorage.setItem('sharebook_vault', JSON.stringify(payload));
-      // Remove legacy plain storage after successful encrypted save
       localStorage.removeItem('passwords');
+      this._schedulePush();
     },
     async _loadVault() {
       const raw = localStorage.getItem('sharebook_vault');
@@ -221,7 +295,6 @@ function passwordManager() {
           iterations: CRYPTO.PBKDF2_ITERATIONS,
           createdAt: Date.now(),
         });
-        // Migrate existing plain data (if any) into encrypted vault
         await this._saveVault();
         this.hasMasterPassword = true;
         this.isFirstSetup = false;
@@ -230,6 +303,9 @@ function passwordManager() {
         this.masterPasswordInput = '';
         this.confirmPasswordInput = '';
         this.showToast('主密碼已設定，資料已加密保護', 'success');
+        if (this.isLoggedIn) {
+          this.pullFromCloud({ silent: true });
+        }
       } catch (err) {
         console.error(err);
         this.unlockError = '設定失敗，請再試一次';
@@ -253,7 +329,6 @@ function passwordManager() {
         this._salt = salt;
         this._cryptoKey = await this._deriveKey(pw, salt);
         this.passwords = await this._loadVault();
-        // Ensure each item has a stable id
         this.passwords = this.passwords.map((p, i) => ({
           ...p,
           id: p.id ?? (Date.now() + i),
@@ -263,6 +338,9 @@ function passwordManager() {
         this.isUnlocked = true;
         this.masterPasswordInput = '';
         this.showToast('已解鎖', 'success');
+        if (this.isLoggedIn) {
+          this.pullFromCloud({ silent: false });
+        }
       } catch (err) {
         console.error(err);
         this._cryptoKey = null;
@@ -280,12 +358,271 @@ function passwordManager() {
       this.searchQuery = '';
       this.closeModal();
       this.cancelImport();
+      this.cancelConflict();
+      this.cloudPanelOpen = false;
       this.masterPasswordInput = '';
       this.unlockError = '';
-      // Signal other tabs
+      this._clearSyncTimer();
       try {
         localStorage.setItem('sharebook_lock_signal', String(Date.now()));
       } catch {}
+    },
+
+    // ── Supabase Auth ──────────────────────────────────────
+    switchAuthMode(mode) {
+      this.authMode = mode;
+      this.authError = '';
+      this.authPassword = '';
+      this.authConfirmPassword = '';
+    },
+
+    async authSubmit() {
+      this.authError = '';
+      const email = (this.authEmail || '').trim();
+      const password = this.authPassword || '';
+      if (!email || !password) {
+        this.authError = '請輸入 Email 與密碼';
+        return;
+      }
+      if (this.authMode === 'register') {
+        if (password.length < 6) {
+          this.authError = '密碼至少 6 個字元';
+          return;
+        }
+        if (password !== this.authConfirmPassword) {
+          this.authError = '兩次輸入的密碼不一致';
+          return;
+        }
+      }
+      const sb = getSupabase();
+      if (!sb) {
+        this.authError = '無法連線雲端服務';
+        return;
+      }
+      if (!this.isOnline) {
+        this.authError = '目前離線，請連上網路後再試';
+        return;
+      }
+      this.authLoading = true;
+      try {
+        if (this.authMode === 'register') {
+          const { data, error } = await sb.auth.signUp({ email, password });
+          if (error) throw error;
+          if (data?.user && !data.session) {
+            this.showToast('註冊成功，請至信箱確認後再登入', 'success');
+            this.authMode = 'login';
+            this.authPassword = '';
+            this.authConfirmPassword = '';
+          } else {
+            this.authUser = data?.user ?? null;
+            this.showToast('註冊並登入成功', 'success');
+            this.authPassword = '';
+            this.authConfirmPassword = '';
+            this.cloudPanelOpen = false;
+            if (this.isUnlocked) await this.pullFromCloud({ silent: false });
+          }
+        } else {
+          const { data, error } = await sb.auth.signInWithPassword({ email, password });
+          if (error) throw error;
+          this.authUser = data?.user ?? null;
+          this.showToast('雲端登入成功', 'success');
+          this.authPassword = '';
+          this.cloudPanelOpen = false;
+          if (this.isUnlocked) await this.pullFromCloud({ silent: false });
+        }
+      } catch (err) {
+        console.error(err);
+        const msg = err?.message || String(err);
+        if (/invalid login credentials/i.test(msg)) {
+          this.authError = 'Email 或密碼錯誤';
+        } else if (/already registered|user already/i.test(msg)) {
+          this.authError = '此 Email 已註冊，請直接登入';
+        } else if (/email not confirmed/i.test(msg)) {
+          this.authError = '請先至信箱確認帳號';
+        } else {
+          this.authError = msg.length > 80 ? '登入失敗，請稍後再試' : msg;
+        }
+      } finally {
+        this.authLoading = false;
+      }
+    },
+
+    async authLogout() {
+      const sb = getSupabase();
+      if (!sb) return;
+      this.authLoading = true;
+      try {
+        await sb.auth.signOut();
+        this.authUser = null;
+        this.syncStatus = 'idle';
+        this.lastSyncedAt = null;
+        this.cloudUpdatedAt = null;
+        this.showToast('已登出雲端帳號', 'success');
+      } catch (e) {
+        console.error(e);
+        this.showToast('登出失敗', 'error');
+      } finally {
+        this.authLoading = false;
+      }
+    },
+
+    // ── Cloud Sync ─────────────────────────────────────────
+    _clearSyncTimer() {
+      if (this._syncTimer) {
+        clearTimeout(this._syncTimer);
+        this._syncTimer = null;
+      }
+    },
+
+    _schedulePush() {
+      if (!this.isLoggedIn || !this.isUnlocked || !this.isOnline) return;
+      if (this._skipNextPush) {
+        this._skipNextPush = false;
+        return;
+      }
+      this._clearSyncTimer();
+      this._syncTimer = setTimeout(() => {
+        this._syncTimer = null;
+        this.pushToCloud();
+      }, SYNC_DEBOUNCE_MS);
+    },
+
+    _buildCloudPayload() {
+      const clean = this.passwords.map(({ _noteOpen, ...rest }) => rest);
+      return {
+        passwords: clean,
+        meta: {
+          count: clean.length,
+          clientUpdatedAt: new Date().toISOString(),
+        },
+      };
+    },
+
+    async pullFromCloud({ silent = false } = {}) {
+      if (!this.isLoggedIn || !this.isUnlocked) return;
+      const sb = getSupabase();
+      if (!sb || !this.isOnline) {
+        if (!silent) this.showToast('離線中，無法同步', 'error');
+        return;
+      }
+      this.syncStatus = 'pulling';
+      try {
+        const { data, error } = await sb
+          .from('app_data')
+          .select('data, updated_at')
+          .eq('owner', this.authUser.id)
+          .eq('app', APP_ID)
+          .maybeSingle();
+
+        if (error) throw error;
+
+        if (!data) {
+          this.syncStatus = 'pushing';
+          await this.pushToCloud({ force: true });
+          if (!silent) this.showToast('已上傳本機資料到雲端', 'success');
+          return;
+        }
+
+        this.cloudUpdatedAt = data.updated_at;
+        const cloudPayload = data.data;
+        const cloudList = Array.isArray(cloudPayload)
+          ? cloudPayload
+          : (cloudPayload?.passwords || []);
+
+        const localClean = this.passwords.map(({ _noteOpen, ...r }) => r);
+        const localStr = JSON.stringify(localClean);
+        const cloudStr = JSON.stringify(cloudList);
+
+        if (localStr === cloudStr) {
+          this.syncStatus = 'synced';
+          this.lastSyncedAt = data.updated_at;
+          if (!silent) this.showToast('已與雲端同步', 'success');
+          return;
+        }
+
+        if (localClean.length === 0 && cloudList.length > 0) {
+          this._applyCloudList(cloudList);
+          this.syncStatus = 'synced';
+          this.lastSyncedAt = data.updated_at;
+          if (!silent) this.showToast('已從雲端載入 ' + cloudList.length + ' 筆', 'success');
+          return;
+        }
+
+        if (cloudList.length === 0 && localClean.length > 0) {
+          await this.pushToCloud({ force: true });
+          if (!silent) this.showToast('已上傳本機資料到雲端', 'success');
+          return;
+        }
+
+        this.conflictCloudData = cloudList;
+        this.conflictCloudUpdatedAt = data.updated_at;
+        this.conflictDialogOpen = true;
+        this.syncStatus = 'idle';
+      } catch (err) {
+        console.error('[pull]', err);
+        this.syncStatus = 'error';
+        if (!silent) this.showToast('同步失敗：' + (err?.message || '請稍後再試'), 'error');
+      }
+    },
+
+    async pushToCloud({ force = false } = {}) {
+      if (!this.isLoggedIn || !this.isUnlocked) return;
+      const sb = getSupabase();
+      if (!sb || !this.isOnline) return;
+      this.syncStatus = 'pushing';
+      try {
+        const payload = this._buildCloudPayload();
+        const row = {
+          owner: this.authUser.id,
+          app: APP_ID,
+          data: payload,
+          updated_at: new Date().toISOString(),
+        };
+        const { data, error } = await sb
+          .from('app_data')
+          .upsert(row, { onConflict: 'owner,app' })
+          .select('updated_at')
+          .single();
+
+        if (error) throw error;
+        this.cloudUpdatedAt = data?.updated_at || row.updated_at;
+        this.lastSyncedAt = this.cloudUpdatedAt;
+        this.syncStatus = 'synced';
+      } catch (err) {
+        console.error('[push]', err);
+        this.syncStatus = 'error';
+        this.showToast('上傳失敗：' + (err?.message || '請稍後再試'), 'error');
+      }
+    },
+
+    _applyCloudList(list) {
+      this._skipNextPush = true;
+      this.passwords = (list || []).map((p, i) => ({
+        ...p,
+        id: p.id ?? (Date.now() + i + Math.random()),
+        _noteOpen: false,
+      }));
+      this._saveVault().catch(console.error);
+    },
+
+    async resolveConflict(choice) {
+      if (choice === 'cloud' && this.conflictCloudData) {
+        this._applyCloudList(this.conflictCloudData);
+        this.lastSyncedAt = this.conflictCloudUpdatedAt;
+        this.cloudUpdatedAt = this.conflictCloudUpdatedAt;
+        this.syncStatus = 'synced';
+        this.showToast('已採用雲端資料', 'success');
+      } else if (choice === 'local') {
+        await this.pushToCloud({ force: true });
+        this.showToast('已以上傳本機資料覆蓋雲端', 'success');
+      }
+      this.cancelConflict();
+    },
+
+    cancelConflict() {
+      this.conflictDialogOpen = false;
+      this.conflictCloudData = null;
+      this.conflictCloudUpdatedAt = null;
     },
 
     // ── CRUD ───────────────────────────────────────────────
@@ -388,7 +725,6 @@ function passwordManager() {
         await navigator.clipboard.writeText(text);
         this.showToast(msg, 'success');
       } catch {
-        // Fallback
         const ta = document.createElement('textarea');
         ta.value = text;
         ta.style.cssText = 'position:fixed;left:-9999px';
@@ -406,9 +742,8 @@ function passwordManager() {
       const blob = new Blob([JSON.stringify(this.passwords, null, 2)], { type: 'application/json' });
       const a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
-      a.download = `分享本本-備份-${new Date().toISOString().slice(0, 10)}.json`;
+      a.download = '分享本本-備份-' + new Date().toISOString().slice(0, 10) + '.json';
       a.click();
-      // Safari / iOS：延遲 revoke，避免下載尚未開始就失效
       setTimeout(() => URL.revokeObjectURL(a.href), 1000);
       this.showToast('JSON 已匯出', 'success');
     },
@@ -433,7 +768,6 @@ function passwordManager() {
           event.target.value = '';
           return;
         }
-        // 開啟選擇：合併 / 取代
         this.importPreview = mapped;
         this.importDialogOpen = true;
       } catch (e) {
@@ -446,7 +780,6 @@ function passwordManager() {
       this.importPreview = [];
     },
     async confirmImport(mode) {
-      // mode: 'merge' | 'replace'
       const mapped = this.importPreview;
       if (!mapped?.length) {
         this.cancelImport();
@@ -456,12 +789,11 @@ function passwordManager() {
         if (mode === 'replace') {
           this.passwords = mapped;
           await this._saveVault();
-          this.showToast(`已取代，共 ${mapped.length} 筆`, 'success');
+          this.showToast('已取代，共 ' + mapped.length + ' 筆', 'success');
         } else {
-          // 合併：新資料放前面，保留既有
           this.passwords = [...mapped, ...this.passwords];
           await this._saveVault();
-          this.showToast(`已合併匯入 ${mapped.length} 筆`, 'success');
+          this.showToast('已合併匯入 ' + mapped.length + ' 筆', 'success');
         }
       } catch (e) {
         console.error(e);
@@ -471,23 +803,20 @@ function passwordManager() {
     },
     exportToHtml() {
       if (!this.isUnlocked) return;
-      const rows = this.passwords.map(p => `
-        <tr>
-          <td>${escapeHtml(p.siteName)}</td>
-          <td>${escapeHtml(p.url)}</td>
-          <td>${escapeHtml(p.username)}</td>
-          <td><code>${escapeHtml(p.password)}</code></td>
-          <td>${escapeHtml(p.notes)}</td>
-        </tr>`).join('');
-      const html = `<!DOCTYPE html><html lang="zh-TW"><head><meta charset="UTF-8"><title>分享本本 匯出</title>
-        <style>body{font-family:system-ui;padding:24px;background:#f7f5f0}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ddd;padding:8px;text-align:left}th{background:#0d9488;color:#fff}code{font-family:ui-monospace,monospace}</style></head>
-        <body><h1>分享本本 · 匯出 ${new Date().toLocaleString('zh-TW')}</h1>
-        <table><thead><tr><th>網站</th><th>網址</th><th>帳號</th><th>密碼</th><th>備註</th></tr></thead>
-        <tbody>${rows}</tbody></table></body></html>`;
+      const rows = this.passwords.map(p =>
+        '<tr><td>' + escapeHtml(p.siteName) + '</td><td>' + escapeHtml(p.url) + '</td><td>' +
+        escapeHtml(p.username) + '</td><td><code>' + escapeHtml(p.password) + '</code></td><td>' +
+        escapeHtml(p.notes) + '</td></tr>'
+      ).join('');
+      const html = '<!DOCTYPE html><html lang="zh-TW"><head><meta charset="UTF-8"><title>分享本本 匯出</title>' +
+        '<style>body{font-family:system-ui;padding:24px;background:#f7f5f0}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ddd;padding:8px;text-align:left}th{background:#0d9488;color:#fff}code{font-family:ui-monospace,monospace}</style></head>' +
+        '<body><h1>分享本本 · 匯出 ' + new Date().toLocaleString('zh-TW') + '</h1>' +
+        '<table><thead><tr><th>網站</th><th>網址</th><th>帳號</th><th>密碼</th><th>備註</th></tr></thead>' +
+        '<tbody>' + rows + '</tbody></table></body></html>';
       const blob = new Blob([html], { type: 'text/html' });
       const a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
-      a.download = `分享本本-${new Date().toISOString().slice(0, 10)}.html`;
+      a.download = '分享本本-' + new Date().toISOString().slice(0, 10) + '.html';
       a.click();
       setTimeout(() => URL.revokeObjectURL(a.href), 1000);
       this.showToast('HTML 已匯出', 'success');
