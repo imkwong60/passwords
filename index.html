@@ -2,7 +2,8 @@
 <html lang="zh-HK">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-eval' https://cdn.jsdelivr.net; connect-src 'self' https://*.supabase.co wss://*.supabase.co; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, maximum-scale=5">
   <meta name="theme-color" content="#0d9488" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#18181b" media="(prefers-color-scheme: dark)">
   <meta name="apple-mobile-web-app-capable" content="yes">
@@ -92,7 +93,7 @@
               :type="showMasterPassword ? 'text' : 'password'"
               x-model="masterPasswordInput"
               :placeholder="isFirstSetup ? '至少 8 個字元' : '輸入主密碼'"
-              autocomplete="current-password"
+              :autocomplete="isFirstSetup ? 'new-password' : 'off'"
               class="w-full px-3.5 py-2.5 pr-10 bg-zinc-100 dark:bg-zinc-800 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-brand-500"
               :disabled="isProcessing"
             >
@@ -126,7 +127,7 @@
       </form>
 
       <p class="text-center text-[10px] text-zinc-400 mt-5 leading-relaxed">
-        PBKDF2 · 120,000 次迭代 · AES-256-GCM<br>
+        PBKDF2 · <span x-text="(pbkdf2Iterations || 120000).toLocaleString('en-US')"></span> 次迭代 · AES-256-GCM<br>
         金鑰僅存在記憶體，關閉分頁即清除
       </p>
     </div>
@@ -274,10 +275,14 @@
               <i class="fa-regular fa-copy text-[10px]"></i>
             </button>
           </div>
-          <!-- Password -->
+          <!-- Password (masked by default) -->
           <div class="flex items-center gap-2 pl-[42px] mb-1">
             <span class="text-[10px] text-zinc-400 w-7 flex-shrink-0">密碼</span>
-            <span class="pwd-chip px-1.5 py-0.5 rounded-md bg-brand-50 dark:bg-brand-900/30 text-brand-800 dark:text-brand-200 select-all" x-text="item.password"></span>
+            <span class="pwd-chip px-1.5 py-0.5 rounded-md bg-brand-50 dark:bg-brand-900/30 text-brand-800 dark:text-brand-200 select-all"
+                  x-text="item._pwdVisible ? item.password : '••••••••'"></span>
+            <button type="button" @click="item._pwdVisible = !item._pwdVisible" class="text-zinc-400 hover:text-brand-600 p-0.5" title="顯示／隱藏">
+              <i class="fa-solid text-[10px]" :class="item._pwdVisible ? 'fa-eye-slash' : 'fa-eye'"></i>
+            </button>
             <button type="button" @click="copyToClipboard(item.password, '密碼已複製')" class="text-zinc-400 hover:text-brand-600 p-0.5" title="複製">
               <i class="fa-regular fa-copy text-[10px]"></i>
             </button>
@@ -308,15 +313,16 @@
 
   <!-- ═══════════════ ITEM MODAL (bottom sheet style) ═══════════════ -->
   <div id="itemModal"
-       class="fixed inset-0 z-50 bg-black/50 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4 transition-all duration-300"
-       :class="isModalOpen ? 'opacity-100 pointer-events-auto' : 'opacity-0 pointer-events-none'"
-       x-show="true"
+       class="fixed inset-0 z-50 bg-black/50 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4"
+       x-show="isModalOpen"
        x-cloak
-       style="display: flex;">
+       role="dialog"
+       aria-modal="true"
+       :aria-hidden="isModalOpen ? 'false' : 'true'"
+       @keydown.escape.window="if (isModalOpen) closeModal()">
     <div class="absolute inset-0" @click="closeModal()"></div>
     <div id="modalSheet"
-         class="relative bg-white dark:bg-zinc-900 w-full max-w-lg rounded-t-3xl sm:rounded-3xl max-h-[88vh] flex flex-col shadow-2xl transform transition-transform duration-300 overflow-hidden border border-zinc-200 dark:border-zinc-800"
-         :class="isModalOpen ? 'translate-y-0' : 'translate-y-full sm:translate-y-4 sm:scale-95'"
+         class="relative bg-white dark:bg-zinc-900 w-full max-w-lg rounded-t-3xl sm:rounded-3xl max-h-[88vh] flex flex-col shadow-2xl overflow-hidden border border-zinc-200 dark:border-zinc-800 animate-fade-in"
          @click.stop>
       <!-- Modal header -->
       <div class="px-5 py-3.5 border-b border-zinc-100 dark:border-zinc-800 flex items-center justify-between bg-zinc-50/60 dark:bg-zinc-800/40">
@@ -496,7 +502,7 @@
           <div class="relative">
             <input :type="showAuthPassword ? 'text' : 'password'" x-model="authPassword"
                    :placeholder="authMode === 'register' ? '密碼（≥6）' : '密碼'"
-                   autocomplete="current-password"
+                   :autocomplete="authMode === 'register' ? 'new-password' : 'current-password'"
                    class="w-full px-2.5 py-1.5 pr-8 bg-zinc-100 dark:bg-zinc-800 rounded-xl text-xs focus:outline-none focus:ring-2 focus:ring-brand-500"
                    :disabled="authLoading">
             <button type="button" @click="showAuthPassword = !showAuthPassword"
@@ -581,49 +587,6 @@
     </template>
   </div>
 
-  <script>
-    /* x-cloak 兜底：無論 Alpine / app.js 是否成功，超時後一定解除，避免白屏 */
-    setTimeout(function () {
-      var b = document.body;
-      if (!b || !b.hasAttribute('x-cloak')) return;
-      b.removeAttribute('x-cloak');
-      if (!window.Alpine || typeof passwordManager !== 'function') {
-        console.warn('[分享本本] 腳本載入不完整');
-        if (!document.getElementById('boot-fail')) {
-          var el = document.createElement('div');
-          el.id = 'boot-fail';
-          el.setAttribute('style', 'position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;padding:1.5rem;background:#fafafa;font-family:system-ui;text-align:center');
-          el.innerHTML = '<div><h1 style="font-size:1.1rem;margin:0 0 .5rem">載入失敗</h1><p style="font-size:.85rem;color:#71717a;margin:0 0 1rem">請檢查網路後重新整理</p><button onclick="location.reload()" style="padding:.6rem 1.2rem;border-radius:999px;border:0;background:#0d9488;color:#fff;font-weight:600;font-size:.85rem">重新整理</button></div>';
-          document.body.appendChild(el);
-        }
-      }
-    }, 3000);
-
-    /* Service Worker：updateViaCache none，避免 sw.js 被 HTTP 快取卡住 */
-    if ('serviceWorker' in navigator) {
-      window.addEventListener('load', function () {
-        navigator.serviceWorker.register('./sw.js', { updateViaCache: 'none' })
-          .then(function (reg) {
-            // 有等待中的新 SW 時可提示用戶（可選）
-            if (reg.waiting) {
-              reg.waiting.postMessage('SKIP_WAITING');
-            }
-            reg.addEventListener('updatefound', function () {
-              var nw = reg.installing;
-              if (!nw) return;
-              nw.addEventListener('statechange', function () {
-                if (nw.state === 'installed' && navigator.serviceWorker.controller) {
-                  // 新版本已就緒；若要強制切換可 postMessage SKIP_WAITING
-                  console.info('[分享本本] 有新版本可用');
-                }
-              });
-            });
-          })
-          .catch(function (err) {
-            console.warn('[分享本本] SW 註冊失敗', err);
-          });
-      });
-    }
-  </script>
+  <script src="./boot.js"></script>
 </body>
 </html>
