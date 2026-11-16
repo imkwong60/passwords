@@ -278,13 +278,14 @@ function passwordManager() {
     _writeMeta(meta) {
       localStorage.setItem('sharebook_meta', JSON.stringify(meta));
     },
-    async _saveVault() {
+    async _saveVault({ skipPush = false } = {}) {
       if (!this._cryptoKey) return;
       const clean = this.passwords.map(({ _noteOpen, _pwdVisible, ...rest }) => rest);
       const payload = await this._encrypt(clean, this._cryptoKey);
       localStorage.setItem('sharebook_vault', JSON.stringify(payload));
       localStorage.removeItem('passwords');
-      this._schedulePush();
+      // skipPush：僅寫本地（例如 adopt KDF 尚未決定衝突結果前），避免提前覆蓋雲端
+      if (!skipPush) this._schedulePush();
     },
     async _loadVault() {
       const raw = localStorage.getItem('sharebook_vault');
@@ -718,7 +719,7 @@ function passwordManager() {
         iterations: cloudIters,
         adoptedFromCloudAt: Date.now(),
       });
-      await this._saveVault();
+      await this._saveVault({ skipPush: true });
     },
 
     async pullFromCloud({ silent = false, password = null } = {}) {
