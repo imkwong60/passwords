@@ -1,10 +1,10 @@
 /**
  * 分享本本 – Secure local password manager
- * AES-GCM + PBKDF2 (120k iterations) · Offline-first
+ * AES-GCM + PBKDF2 (600k iterations) · Offline-first
  * + Supabase Email 登入與 app_data 同步
  */
 const CRYPTO = {
-  PBKDF2_ITERATIONS: 120_000,
+  PBKDF2_ITERATIONS: 600_000,
   SALT_BYTES: 16,
   IV_BYTES: 12,
   KEY_BITS: 256,
@@ -112,23 +112,23 @@ function passwordManager() {
         }
       });
       this._autoLockMs = 5 * 60 * 1000; // 背景 5 分鐘後自動鎖定
-      this._autoLockTimer = null;
+      this._hiddenAt = null;
       document.addEventListener('visibilitychange', () => {
         if (document.visibilityState === 'hidden' && this.isUnlocked) {
-          // 背景時立刻 flush 待發 push
+          // 背景時立刻 flush 待發 push（不阻塞）
           if (this._syncTimer && this._cryptoKey && this.isLoggedIn && this.isOnline) {
             this._clearSyncTimer();
             this.pushToCloud({ force: true }).catch(() => {});
           }
-          this._clearAutoLockTimer();
-          this._autoLockTimer = setTimeout(() => {
-            if (this.isUnlocked) {
-              this.lock();
-              this.showToast('已因閒置自動鎖定', 'info');
-            }
-          }, this._autoLockMs);
+          this._hiddenAt = Date.now();
         } else if (document.visibilityState === 'visible') {
-          this._clearAutoLockTimer();
+          // 用時間戳判斷，避免背景 setTimeout 被節流而永遠不鎖
+          if (this._hiddenAt && this.isUnlocked &&
+              (Date.now() - this._hiddenAt) >= this._autoLockMs) {
+            this.lock();
+            this.showToast('已因閒置自動鎖定', 'info');
+          }
+          this._hiddenAt = null;
         }
       });
       await this._bootstrap();
@@ -183,7 +183,8 @@ function passwordManager() {
           if (this.authUser) {
             this.authEmail = this.authUser.email || '';
             if (this.isUnlocked && event === 'SIGNED_IN') {
-              this.pullFromCloud({ silent: false });
+              // 延遲到 auth 鎖外，避免 supabase-js 回調內 await 查詢死鎖
+              setTimeout(() => this.pullFromCloud({ silent: false }), 0);
             }
           } else {
             this.syncStatus = 'idle';
@@ -398,14 +399,28 @@ function passwordManager() {
       }
     },
 
-    async lock() {
-      // 鎖定前先 flush 待發雲端 push，避免本地已存、雲端落後
-      if (this._syncTimer && this._cryptoKey && this.isLoggedIn && this.isOnline) {
-        this._clearSyncTimer();
-        try { await this.pushToCloud({ force: true }); } catch (e) { console.warn('[flush on lock]', e); }
-      } else {
-        this._clearSyncTimer();
+    lock() {
+      // 若有待發 push：先 snapshot，立刻清空記憶體，再非同步上傳（不阻塞鎖定）
+      const shouldFlush = !!(this._syncTimer && this._cryptoKey && this.isLoggedIn && this.isOnline && this._masterPassword);
+      this._clearSyncTimer();
+      let flushSnap = null;
+      if (shouldFlush) {
+        try {
+          flushSnap = {
+            owner: this.authUser?.id,
+            passwords: this.passwords.map(({ _noteOpen, _pwdVisible, ...rest }) => rest),
+            masterPassword: this._masterPassword,
+            salt: this._salt,
+            saltB64: this._salt ? this._bufToB64(this._salt) : (this._readMeta()?.salt || null),
+            iterations: this.pbkdf2Iterations || CRYPTO.PBKDF2_ITERATIONS,
+          };
+        } catch (e) {
+          console.warn('[lock snapshot]', e);
+          flushSnap = null;
+        }
       }
+
+      // 核心鎖定：同步立即執行
       this._cryptoKey = null;
       this._masterPassword = null;
       this.passwords = [];
@@ -418,10 +433,48 @@ function passwordManager() {
       this.cloudPanelOpen = false;
       this.masterPasswordInput = '';
       this.unlockError = '';
-      this._clearAutoLockTimer();
+      this._hiddenAt = null;
       try {
         localStorage.setItem('sharebook_lock_signal', String(Date.now()));
       } catch {}
+
+      if (flushSnap) {
+        this._flushPushSnapshot(flushSnap).catch((e) => console.warn('[flush on lock]', e));
+      }
+    },
+
+    /** 用鎖定前 snapshot 上傳（金鑰已從 UI 狀態清除） */
+    async _flushPushSnapshot(snap) {
+      if (!snap?.owner || !snap.masterPassword || !snap.saltB64) return;
+      const sb = getSupabase();
+      if (!sb || !navigator.onLine) return;
+      try {
+        const saltBuf = this._b64ToBuf(snap.saltB64);
+        const key = await this._deriveKey(snap.masterPassword, saltBuf, snap.iterations);
+        const plain = {
+          passwords: snap.passwords,
+          meta: { count: snap.passwords.length, clientUpdatedAt: new Date().toISOString() },
+        };
+        const sealed = await this._encrypt(plain, key);
+        const payload = {
+          v: 3,
+          enc: true,
+          salt: snap.saltB64,
+          iterations: snap.iterations,
+          iv: sealed.iv,
+          data: sealed.data,
+        };
+        await sb.from('app_data').upsert({
+          owner: snap.owner,
+          app: APP_ID,
+          data: payload,
+          updated_at: new Date().toISOString(),
+        }, { onConflict: 'owner,app' });
+      } finally {
+        // 盡力清除 snapshot 內敏感欄位
+        snap.masterPassword = null;
+        snap.passwords = null;
+      }
     },
 
     // ── Supabase Auth ──────────────────────────────────────
@@ -530,6 +583,7 @@ function passwordManager() {
       }
     },
     _clearAutoLockTimer() {
+      this._hiddenAt = null;
       if (this._autoLockTimer) {
         clearTimeout(this._autoLockTimer);
         this._autoLockTimer = null;
