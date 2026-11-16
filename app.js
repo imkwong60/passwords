@@ -49,6 +49,7 @@ function passwordManager() {
     isLocked: true,
     hasMasterPassword: false,
     isFirstSetup: false,
+    pbkdf2Iterations: CRYPTO.PBKDF2_ITERATIONS,
     masterPasswordInput: '',
     confirmPasswordInput: '',
     unlockError: '',
@@ -109,9 +110,24 @@ function passwordManager() {
           this.lock();
         }
       });
+      this._autoLockMs = 5 * 60 * 1000; // 背景 5 分鐘後自動鎖定
+      this._autoLockTimer = null;
       document.addEventListener('visibilitychange', () => {
         if (document.visibilityState === 'hidden' && this.isUnlocked) {
-          // soft lock optional
+          // 背景時立刻 flush 待發 push
+          if (this._syncTimer && this._cryptoKey && this.isLoggedIn && this.isOnline) {
+            this._clearSyncTimer();
+            this.pushToCloud({ force: true }).catch(() => {});
+          }
+          this._clearAutoLockTimer();
+          this._autoLockTimer = setTimeout(() => {
+            if (this.isUnlocked) {
+              this.lock();
+              this.showToast('已因閒置自動鎖定', 'info');
+            }
+          }, this._autoLockMs);
+        } else if (document.visibilityState === 'visible') {
+          this._clearAutoLockTimer();
         }
       });
       await this._bootstrap();
@@ -128,13 +144,18 @@ function passwordManager() {
         this.isLocked = true;
         this.isUnlocked = false;
         this.isFirstSetup = false;
+        // 已有加密庫：立刻清除殘留明文，避免中間視窗
+        if (plain) {
+          try { localStorage.removeItem('passwords'); } catch {}
+        }
       } else if (plain) {
         this.hasMasterPassword = false;
         this.isFirstSetup = true;
         this.isLocked = true;
         this.isUnlocked = false;
         try {
-          this.passwords = JSON.parse(plain) || [];
+          const parsed = JSON.parse(plain);
+          this.passwords = Array.isArray(parsed) ? parsed : [];
         } catch {
           this.passwords = [];
         }
@@ -205,7 +226,7 @@ function passwordManager() {
       for (let i = 0; i < s.length; i++) bytes[i] = s.charCodeAt(i);
       return bytes.buffer;
     },
-    async _deriveKey(password, salt) {
+    async _deriveKey(password, salt, iterations = CRYPTO.PBKDF2_ITERATIONS) {
       const enc = new TextEncoder();
       const keyMaterial = await crypto.subtle.importKey(
         'raw', enc.encode(password), 'PBKDF2', false, ['deriveKey']
@@ -214,7 +235,7 @@ function passwordManager() {
         {
           name: 'PBKDF2',
           salt,
-          iterations: CRYPTO.PBKDF2_ITERATIONS,
+          iterations,
           hash: 'SHA-256',
         },
         keyMaterial,
@@ -258,7 +279,7 @@ function passwordManager() {
     },
     async _saveVault() {
       if (!this._cryptoKey) return;
-      const clean = this.passwords.map(({ _noteOpen, ...rest }) => rest);
+      const clean = this.passwords.map(({ _noteOpen, _pwdVisible, ...rest }) => rest);
       const payload = await this._encrypt(clean, this._cryptoKey);
       localStorage.setItem('sharebook_vault', JSON.stringify(payload));
       localStorage.removeItem('passwords');
@@ -268,15 +289,17 @@ function passwordManager() {
       const raw = localStorage.getItem('sharebook_vault');
       if (!raw || !this._cryptoKey) return [];
       const payload = JSON.parse(raw);
-      return await this._decrypt(payload, this._cryptoKey);
+      const data = await this._decrypt(payload, this._cryptoKey);
+      return Array.isArray(data) ? data : [];
     },
 
     // ── Unlock / Setup ─────────────────────────────────────
     async setupMasterPassword() {
       this.unlockError = '';
-      const pw = this.masterPasswordInput.trim();
-      const confirm = this.confirmPasswordInput.trim();
-      if (pw.length < 8) {
+      // 不 trim：前後空格視為密碼的一部分（與 unlock 一致）
+      const pw = this.masterPasswordInput;
+      const confirm = this.confirmPasswordInput;
+      if (!pw || pw.length < 8) {
         this.unlockError = '主密碼至少需要 8 個字元';
         return;
       }
@@ -288,7 +311,8 @@ function passwordManager() {
       try {
         const salt = crypto.getRandomValues(new Uint8Array(CRYPTO.SALT_BYTES));
         this._salt = salt;
-        this._cryptoKey = await this._deriveKey(pw, salt);
+        this._cryptoKey = await this._deriveKey(pw, salt, CRYPTO.PBKDF2_ITERATIONS);
+        this.pbkdf2Iterations = CRYPTO.PBKDF2_ITERATIONS;
         this._writeMeta({
           version: 1,
           salt: this._bufToB64(salt),
@@ -327,13 +351,33 @@ function passwordManager() {
         if (!meta?.salt) throw new Error('No meta');
         const salt = this._b64ToBuf(meta.salt);
         this._salt = salt;
-        this._cryptoKey = await this._deriveKey(pw, salt);
+        const storedIters = (typeof meta.iterations === 'number' && meta.iterations > 0)
+          ? meta.iterations
+          : CRYPTO.PBKDF2_ITERATIONS;
+        this.pbkdf2Iterations = storedIters;
+        this._cryptoKey = await this._deriveKey(pw, salt, storedIters);
         this.passwords = await this._loadVault();
         this.passwords = this.passwords.map((p, i) => ({
           ...p,
           id: p.id ?? (Date.now() + i),
           _noteOpen: false,
+          _pwdVisible: false,
         }));
+        // 迭代升級：meta 記錄的 iterations 低於目前常數 → 用新迭代重派生並重寫 vault
+        if (storedIters < CRYPTO.PBKDF2_ITERATIONS) {
+          try {
+            this._cryptoKey = await this._deriveKey(pw, salt, CRYPTO.PBKDF2_ITERATIONS);
+            this.pbkdf2Iterations = CRYPTO.PBKDF2_ITERATIONS;
+            this._writeMeta({
+              ...meta,
+              iterations: CRYPTO.PBKDF2_ITERATIONS,
+              upgradedAt: Date.now(),
+            });
+            await this._saveVault();
+          } catch (upErr) {
+            console.warn('[iterations upgrade]', upErr);
+          }
+        }
         this.isLocked = false;
         this.isUnlocked = true;
         this.masterPasswordInput = '';
@@ -350,7 +394,14 @@ function passwordManager() {
       }
     },
 
-    lock() {
+    async lock() {
+      // 鎖定前先 flush 待發雲端 push，避免本地已存、雲端落後
+      if (this._syncTimer && this._cryptoKey && this.isLoggedIn && this.isOnline) {
+        this._clearSyncTimer();
+        try { await this.pushToCloud({ force: true }); } catch (e) { console.warn('[flush on lock]', e); }
+      } else {
+        this._clearSyncTimer();
+      }
       this._cryptoKey = null;
       this.passwords = [];
       this.isUnlocked = false;
@@ -362,7 +413,7 @@ function passwordManager() {
       this.cloudPanelOpen = false;
       this.masterPasswordInput = '';
       this.unlockError = '';
-      this._clearSyncTimer();
+      this._clearAutoLockTimer();
       try {
         localStorage.setItem('sharebook_lock_signal', String(Date.now()));
       } catch {}
@@ -473,6 +524,12 @@ function passwordManager() {
         this._syncTimer = null;
       }
     },
+    _clearAutoLockTimer() {
+      if (this._autoLockTimer) {
+        clearTimeout(this._autoLockTimer);
+        this._autoLockTimer = null;
+      }
+    },
 
     _schedulePush() {
       if (!this.isLoggedIn || !this.isUnlocked || !this.isOnline) return;
@@ -487,19 +544,59 @@ function passwordManager() {
       }, SYNC_DEBOUNCE_MS);
     },
 
-    _buildCloudPayload() {
-      const clean = this.passwords.map(({ _noteOpen, ...rest }) => rest);
-      return {
+    /**
+     * 雲端 payload：用目前已解鎖的 _cryptoKey（主密碼衍生）做 AES-GCM 加密。
+     * 結構：{ v: 2, enc: true, iv, data } — 明文不會上雲。
+     * 拉取時用同一把記憶體金鑰自動解密，不必再輸入密碼。
+     */
+    async _buildCloudPayloadEncrypted() {
+      if (!this._cryptoKey) throw new Error('尚未解鎖，無法加密上傳');
+      const clean = this.passwords.map(({ _noteOpen, _pwdVisible, ...rest }) => rest);
+      const plain = {
         passwords: clean,
         meta: {
           count: clean.length,
           clientUpdatedAt: new Date().toISOString(),
         },
       };
+      const sealed = await this._encrypt(plain, this._cryptoKey);
+      return {
+        v: 2,
+        enc: true,
+        iv: sealed.iv,
+        data: sealed.data,
+      };
+    },
+
+    /** 解析雲端 data：支援加密(v2)與舊明文(相容)，回傳 passwords 陣列 */
+    async _decodeCloudData(cloudPayload) {
+      if (!cloudPayload) return [];
+
+      // 加密格式：{ v:2, enc:true, iv, data }
+      if (cloudPayload && cloudPayload.enc === true && cloudPayload.iv && cloudPayload.data) {
+        if (!this._cryptoKey) throw new Error('尚未解鎖，無法解密雲端資料');
+        try {
+          const plain = await this._decrypt(
+            { iv: cloudPayload.iv, data: cloudPayload.data },
+            this._cryptoKey
+          );
+          if (Array.isArray(plain)) return plain;
+          if (plain && Array.isArray(plain.passwords)) return plain.passwords;
+          return [];
+        } catch (e) {
+          console.error('[cloud decrypt]', e);
+          throw new Error('雲端資料解密失敗（可能主密碼不同）');
+        }
+      }
+
+      // 舊版明文相容
+      if (Array.isArray(cloudPayload)) return cloudPayload;
+      if (cloudPayload && Array.isArray(cloudPayload.passwords)) return cloudPayload.passwords;
+      return [];
     },
 
     async pullFromCloud({ silent = false } = {}) {
-      if (!this.isLoggedIn || !this.isUnlocked) return;
+      if (!this.isLoggedIn || !this.isUnlocked || !this._cryptoKey) return;
       const sb = getSupabase();
       if (!sb || !this.isOnline) {
         if (!silent) this.showToast('離線中，無法同步', 'error');
@@ -519,23 +616,38 @@ function passwordManager() {
         if (!data) {
           this.syncStatus = 'pushing';
           await this.pushToCloud({ force: true });
-          if (!silent) this.showToast('已上傳本機資料到雲端', 'success');
+          if (!silent) this.showToast('已上傳本機資料到雲端（已加密）', 'success');
           return;
         }
 
         this.cloudUpdatedAt = data.updated_at;
-        const cloudPayload = data.data;
-        const cloudList = Array.isArray(cloudPayload)
-          ? cloudPayload
-          : (cloudPayload?.passwords || []);
+        let cloudList;
+        try {
+          cloudList = await this._decodeCloudData(data.data);
+        } catch (decErr) {
+          this.syncStatus = 'error';
+          if (!silent) this.showToast(decErr.message || '雲端解密失敗', 'error');
+          return;
+        }
 
-        const localClean = this.passwords.map(({ _noteOpen, ...r }) => r);
+        // 舊明文：自動升級為加密後再存回（背景，不擋主流程）
+        const raw = data.data;
+        const isLegacyPlain = raw && raw.enc !== true && (
+          Array.isArray(raw) || (raw && Array.isArray(raw.passwords))
+        );
+        if (isLegacyPlain && cloudList) {
+          // 下一輪 push 會寫入加密版
+        }
+
+        const localClean = this.passwords.map(({ _noteOpen, _pwdVisible, ...r }) => r);
         const localStr = JSON.stringify(localClean);
         const cloudStr = JSON.stringify(cloudList);
 
         if (localStr === cloudStr) {
           this.syncStatus = 'synced';
           this.lastSyncedAt = data.updated_at;
+          // 若仍是舊明文，順手升級加密
+          if (isLegacyPlain) await this.pushToCloud({ force: true });
           if (!silent) this.showToast('已與雲端同步', 'success');
           return;
         }
@@ -544,13 +656,14 @@ function passwordManager() {
           this._applyCloudList(cloudList);
           this.syncStatus = 'synced';
           this.lastSyncedAt = data.updated_at;
+          if (isLegacyPlain) await this.pushToCloud({ force: true });
           if (!silent) this.showToast('已從雲端載入 ' + cloudList.length + ' 筆', 'success');
           return;
         }
 
         if (cloudList.length === 0 && localClean.length > 0) {
           await this.pushToCloud({ force: true });
-          if (!silent) this.showToast('已上傳本機資料到雲端', 'success');
+          if (!silent) this.showToast('已上傳本機資料到雲端（已加密）', 'success');
           return;
         }
 
@@ -566,12 +679,12 @@ function passwordManager() {
     },
 
     async pushToCloud({ force = false } = {}) {
-      if (!this.isLoggedIn || !this.isUnlocked) return;
+      if (!this.isLoggedIn || !this.isUnlocked || !this._cryptoKey) return;
       const sb = getSupabase();
       if (!sb || !this.isOnline) return;
       this.syncStatus = 'pushing';
       try {
-        const payload = this._buildCloudPayload();
+        const payload = await this._buildCloudPayloadEncrypted();
         const row = {
           owner: this.authUser.id,
           app: APP_ID,
@@ -601,6 +714,7 @@ function passwordManager() {
         ...p,
         id: p.id ?? (Date.now() + i + Math.random()),
         _noteOpen: false,
+        _pwdVisible: false,
       }));
       this._saveVault().catch(console.error);
     },
@@ -678,6 +792,7 @@ function passwordManager() {
             notes: (d.notes || '').trim(),
             createdAt: Date.now(),
             _noteOpen: false,
+            _pwdVisible: false,
           });
         }
         await this._saveVault();
@@ -750,19 +865,47 @@ function passwordManager() {
     async importFromJson(event) {
       const file = event.target.files?.[0];
       if (!file) return;
+      const MAX_BYTES = 5 * 1024 * 1024; // 5MB
+      if (file.size > MAX_BYTES) {
+        this.showToast('檔案過大（上限 5MB）', 'error');
+        event.target.value = '';
+        return;
+      }
       try {
         const text = await file.text();
+        if (text.length > MAX_BYTES) {
+          this.showToast('檔案過大（上限 5MB）', 'error');
+          event.target.value = '';
+          return;
+        }
         const data = JSON.parse(text);
-        if (!Array.isArray(data)) throw new Error('格式錯誤');
-        const mapped = data.map((p, i) => ({
-          id: p.id ?? (Date.now() + i + Math.random()),
-          siteName: p.siteName || p.site || '',
-          url: p.url || '',
-          username: p.username || p.user || '',
-          password: p.password || '',
-          notes: p.notes || '',
-          _noteOpen: false,
-        })).filter(p => p.siteName && p.username);
+        if (!Array.isArray(data)) throw new Error('格式錯誤：需為陣列');
+        if (data.length > 10000) {
+          this.showToast('項目過多（上限 10000 筆）', 'error');
+          event.target.value = '';
+          return;
+        }
+        const mapped = data.map((p, i) => {
+          if (!p || typeof p !== 'object') return null;
+          // 欄位白名單：只取已知鍵
+          const siteName = String(p.siteName || p.site || '').slice(0, 500);
+          const username = String(p.username || p.user || '').slice(0, 500);
+          const password = String(p.password || '').slice(0, 2000);
+          const url = String(p.url || '').slice(0, 2000);
+          const notes = String(p.notes || '').slice(0, 5000);
+          if (!siteName || !username) return null;
+          return {
+            id: (typeof p.id === 'number' || typeof p.id === 'string') ? p.id : (Date.now() + i + Math.random()),
+            siteName,
+            url,
+            username,
+            password,
+            notes,
+            createdAt: typeof p.createdAt === 'number' ? p.createdAt : undefined,
+            _noteOpen: false,
+            _pwdVisible: false,
+          };
+        }).filter(Boolean);
         if (mapped.length === 0) {
           this.showToast('檔案內沒有可匯入的項目', 'error');
           event.target.value = '';
